@@ -68,7 +68,7 @@ namespace Arcade.Gameplay
 				t.Position = timing.CalculatePositionByTiming(t.Timing, t.TimingGroup);
 				float endPosition = timing.CalculatePositionByTiming(t.EndTiming, t.TimingGroup);
 				t.Enable = true;
-				if (t.Judging)
+				if (t.Judging || (t.NoInput() && t.Timing < ArcGameplayManager.Instance.ChartTiming))
 				{
 					t.Position = 0;
 				}
