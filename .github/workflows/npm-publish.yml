@@ -1,104 +1,156 @@
 name: docker npm published
 
+# 支持手动触发 + 可选定时触发（如需）
 on:
-  workflow_dispatch: 
+  workflow_dispatch:
     inputs:
-      workers:
-        description: '备用：并发线程数（单文件无需调整）'
+      file_url:
+        description: 'https://github.com/mozilla/pdf.js-sample-files/raw/master/tracemonkey.pdf'
+        required: true
+        default: 'https://github.com/mozilla/pdf.js-sample-files/raw/master/tracemonkey.pdf'
+      volume_size:
+        description: '分卷大小'
         required: false
-        default: '1'
+        default: '1900m'
+      compression_level:
+        description: '压缩级别（0=仅打包(快)，9=最高压缩(慢)）'
+        required: false
+        default: '0'
+  # 可选：定时触发（每天凌晨1点执行，注释掉则仅手动触发）
+  # schedule:
+  #   - cron: '0 1 * * *'
 
 jobs:
-  download_and_release:
+  download_and_split:
     runs-on: ubuntu-latest
+    # 延长超时时间（默认360分钟=6小时）
+    timeout-minutes: 360
     permissions:
       contents: write  # 发布Release必需
+      actions: read     # 读取Action日志（可选）
 
     steps:
-      - name: 清理服务器空间
+      - name: 步骤1 - 系统信息检查
         run: |
-          echo "=== 初始磁盘空间 ==="
-          df -h
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
-          sudo docker image prune --all --force
-          sudo apt clean && sudo apt autoremove -y
-          echo "=== 清理后磁盘空间 ==="
-          df -h
+          echo "=== 系统基本信息 ==="
+          uname -a
+          echo "=== CPU核心数 ==="
+          nproc
+          echo "=== 内存大小 ==="
+          free -h
+          echo "=== 磁盘空间（清理前） ==="
+          df -h /
 
-      - name: 下载文件并处理文件名（移除特殊字符）
-#        env:
-#          SP_COOKIE: ${{ secrets.git }}
+      - name: 步骤2 - 极致清理磁盘空间（关键）
         run: |
-          set -euo pipefail
-          mkdir -p ./downloads && cd ./downloads
-
-          # 下载链接
-          URL="https://github.com/mozilla/pdf.js-sample-files/raw/master/tracemonkey.pdf"
-
-          # 修复后的curl命令
-          curl -L -A "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
-               -OJ -f -sS --show-error "$URL"
-
-          # 关键1：获取实际文件名，并清理特殊字符（%/空格/括号等）-H "Cookie: $SP_COOKIE" \
-          ACTUAL_FILENAME_RAW=$(ls -1)
-          # 清理规则：%→_、空格→_、括号→空、其他特殊字符保留
-          ACTUAL_FILENAME_CLEAN=$(echo "$ACTUAL_FILENAME_RAW" | sed -e 's/%/_/g' -e 's/ /_/g' -e 's/(/./g' -e 's/)/./g')
-          # 重命名下载的文件（避免特殊字符问题）
-          mv "$ACTUAL_FILENAME_RAW" "$ACTUAL_FILENAME_CLEAN"
-
-          # 关键2：用清理后的文件名作为分卷名
-          VOLUME_NAME="${ACTUAL_FILENAME_CLEAN%.*}"
+          echo "=== 开始清理非必要文件 ==="
+          # 1. 删除大体积预装软件
+          sudo rm -rf /usr/local/* /opt/* /var/cache/apt/* /var/log/*
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /usr/lib/jvm /usr/share/man
+          # 2. 清理Docker残留（最大的空间占用）
+          sudo docker system prune -a -f --volumes
+          # 3. 清理APT缓存
+          sudo apt update && sudo apt autoremove -y && sudo apt clean -y
+          # 4. 删除临时文件
+          sudo rm -rf /tmp/* ~/.cache/*
           
-          # 写入临时文件
-          echo "$ACTUAL_FILENAME_CLEAN" > ../actual_filename.txt
-          echo "$VOLUME_NAME" > ../volume_name.txt
+          echo "=== 磁盘空间（清理后） ==="
+          df -h /
+          # 检查可用空间，低于10GB则终止（避免后续失败）
+          AVAILABLE_SPACE=$(df -h / | grep / | awk '{print $4}' | sed 's/G//g')
+          if (( $(echo "$AVAILABLE_SPACE < 10" | bc -l) )); then
+            echo "❌ 可用磁盘空间不足10GB，终止任务"
+            exit 1
+          fi
 
-          echo "✅ 下载完成，原始文件名：$ACTUAL_FILENAME_RAW"
-          echo "✅ 清理后文件名：$ACTUAL_FILENAME_CLEAN"
-          echo "✅ 分卷基础名：$VOLUME_NAME"
-          ls -lh
-
-      - name: 分卷压缩（修复匹配逻辑）
-        if: success()
+      - name: 步骤3 - cut
+        id: download
         run: |
           set -euo pipefail
-          cd ./downloads
+          # 创建工作目录
+          mkdir -p ./large_file && cd ./large_file
 
-          # 读取清理后的文件名
-          ACTUAL_FILENAME=$(cat ../actual_filename.txt)
-          VOLUME_NAME=$(cat ../volume_name.txt)
+          # 提取并清理文件名（避免特殊字符导致解析错误）
+          FILE_NAME_RAW=$(basename "${{ github.event.inputs.file_url }}")
+          # 清理规则：替换所有特殊字符为下划线/点
+          FILE_NAME_CLEAN=$(echo "$FILE_NAME_RAW" | sed -e 's/[% \(\)&=+,:;@#~!$^*]/_/g' -e 's/\./-/g' | sed -e 's/_-_/./g' -e 's/__/_/g')
+          VOLUME_BASE_NAME="${FILE_NAME_CLEAN%.*}"
+          FINAL_VOLUME_NAME="${VOLUME_BASE_NAME}_$(date +%Y%m%d_%H%M%S)" # 加时间戳避免重复
 
-          # 检查文件存在性（用引号包裹，兼容特殊字符）
-          if [ ! -f "$ACTUAL_FILENAME" ]; then
-            echo "❌ 源文件 '$ACTUAL_FILENAME' 不存在"
-            exit 1
-          fi
+          echo "=== 下载配置 ==="
+          echo "源文件直链：${{ github.event.inputs.file_url }}"
+          echo "清理后文件名：$FILE_NAME_CLEAN"
+          echo "分卷基础名：$FINAL_VOLUME_NAME"
+          echo "分卷大小：${{ github.event.inputs.volume_size }}"
+          echo "压缩级别：${{ github.event.inputs.compression_level }}"
 
-          # 分卷压缩（用清理后的文件名，无特殊字符）
-          7z a -v1900m -mx0 "$VOLUME_NAME.7z" "$ACTUAL_FILENAME"
+          # 核心命令：流式下载 + 实时分卷
+          echo "=== 开始流式下载并分卷（todo） ==="
+          curl -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+               -s --progress-bar --retry 3 --retry-delay 5 "${{ github.event.inputs.file_url }}" | \
+               7z a -v${{ github.event.inputs.volume_size }} -mx${{ github.event.inputs.compression_level }} -si "$FINAL_VOLUME_NAME.7z"
 
-          # 修复：正确验证分卷（禁用通配符，用find命令匹配）
-          VOLUME_COUNT=$(find . -maxdepth 1 -name "$VOLUME_NAME.7z.*" -type f | wc -l)
+          # 验证分卷结果
+          echo "=== 验证分卷文件 ==="
+          VOLUME_COUNT=$(find . -maxdepth 1 -name "$FINAL_VOLUME_NAME.7z.*" -type f | wc -l)
           if [ "$VOLUME_COUNT" -eq 0 ]; then
-            echo "❌ 分卷压缩失败：未找到分卷文件"
+            echo "❌ 分卷失败：未生成任何分卷文件"
             exit 1
           fi
 
-          echo "✅ 分卷完成：共生成 $VOLUME_COUNT 个分卷"
-          ls -lh "$VOLUME_NAME.7z."*
+          # 统计分卷信息
+          TOTAL_SIZE=$(du -hc "$FINAL_VOLUME_NAME.7z."* | grep total | awk '{print $1}')
+          echo "✅ 分卷完成！"
+          echo "分卷数量：$VOLUME_COUNT 个"
+          echo "总大小：$TOTAL_SIZE"
+          echo "分卷列表："
+          ls -lh "$FINAL_VOLUME_NAME.7z."*
 
-      - name: 发布Release并上传分卷
+          # 写入关键信息到临时文件（供后续步骤使用）
+          echo "$FINAL_VOLUME_NAME" > ../volume_name.txt
+          echo "$VOLUME_COUNT" > ../volume_count.txt
+          echo "$TOTAL_SIZE" > ../total_size.txt
+          echo "$FILE_NAME_CLEAN" > ../file_name.txt
+
+          # 设置输出变量（供GitHub Actions后续步骤调用）
+          echo "volume_name=$FINAL_VOLUME_NAME" >> $GITHUB_OUTPUT
+
+      - name: 步骤4 - 发布Release（上传所有分卷）
         if: success()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "maimai-file-v${{ github.run_number }}"
-          name: "Maimai 文件发布 v${{ github.run_number }}"
+          # Release标签（含时间戳，避免重复）
+          tag_name: "large-file-${{ steps.download.outputs.volume_name }}-${{ github.run_number }}"
+          # Release名称
+          name: "文件分卷 - ${{ steps.download.outputs.volume_name }} v${{ github.run_number }}"
+          # Release描述（详细信息）
           body: |
-            ## 下载完成（自动分卷）
-            - 清理后文件名：$(cat actual_filename.txt)
-            - 分卷文件：$(cat volume_name.txt).7z.*（共 $(find ./downloads -name "$(cat volume_name.txt).7z.*" | wc -l) 卷，每卷1900MB）
-            - 解压方式：下载所有分卷后，用7-Zip打开第一个.7z.001文件自动合并解压
-          # 用find命令匹配分卷，避免通配符问题
-          files: |
-            ./downloads/$(cat volume_name.txt).7z.*
-#            ./downloads/$(cat volume_name.txt).7z.*
+            ## 文件分卷发布完成
+            - 源文件直链：${{ github.event.inputs.file_url }}
+            - 原始文件名：$(cat file_name.txt)
+            - 分卷基础名：$(cat volume_name.txt)
+            - 分卷数量：$(cat volume_count.txt) 卷
+            - 单卷大小：${{ github.event.inputs.volume_size }}
+            - 分卷总大小：$(cat total_size.txt)
+            - 压缩级别：${{ github.event.inputs.compression_level }}（0=仅打包，9=最高压缩）
+            - 下载时间：${{ github.run_at }}
+            - Action运行ID：${{ github.run_id }}
+
+            ### ok
+
+            ### downed
+            - down
+          # 上传所有分卷文件（精准匹配，避免漏传）
+          files: ./large_file/${{ steps.download.outputs.volume_name }}.7z.*
+          # 标记为最新Release
+          make_latest: true
+
+      - name: 步骤5 - 失败通知（可选，需配置GitHub Actions Secrets）
+        if: failure()
+        run: |
+          echo "❌ 文件分卷任务失败！"
+          echo "失败时间：$(date)"
+          echo "Action运行ID：${{ github.run_id }}"
+          echo "请检查日志：https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # 可选：添加钉钉/企业微信/邮件通知（示例）
+          # curl -X POST -H "Content-Type: application/json" -d '{"msgtype":"text","text":{"content":"分卷任务失败！运行ID：${{ github.run_id }}"}}' https://oapi.dingtalk.com/robot/send?access_token=${{ secrets.DINGTALK_TOKEN }}
