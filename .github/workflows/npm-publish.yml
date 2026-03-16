@@ -19,7 +19,7 @@ on:
 jobs:
   download_and_split:
     runs-on: ubuntu-latest
-    timeout-minutes:720
+#    timeout-minutes:720
     permissions:
       contents: write
 
