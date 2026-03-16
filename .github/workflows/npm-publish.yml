@@ -26,8 +26,8 @@ jobs:
           df -h
 
       - name: 下载文件并获取实际文件名（极简方案）
-        env:
-          SP_COOKIE: ${{ secrets.git }}
+#        env:
+#          SP_COOKIE: ${{ secrets.git }}
         run: |
           set -euo pipefail
           mkdir -p ./downloads && cd ./downloads
@@ -37,10 +37,11 @@ jobs:
 
           # 下载文件（-OJ 自动用服务器返回的文件名）
           curl -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-               -H "Cookie: $SP_COOKIE" \
+               
                -OJ -f -sS --show-error "$URL"
 
-          # 关键：下载后直接读取实际文件名（无URL解码、无特殊字符处理）
+
+          # 关键：下载后直接读取实际文件名（无URL解码、无特殊字符处理）-H "Cookie: $SP_COOKIE" \
           # 因为只下载1个文件，ls -1 直接获取唯一文件名
           ACTUAL_FILENAME=$(ls -1)
           # 去掉后缀作为分卷名（用shell变量写入文件，规避env上下文问题）
