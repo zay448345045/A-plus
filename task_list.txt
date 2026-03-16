@@ -1,0 +1,11 @@
+# 注释行（以#开头，Runner会跳过）
+# 示例1：通用大文件（iso/zip/rar等）
+general|https://baidu.com|pending|maimai游戏镜像
+general|https://example.com/file.zip|pending|测试大文件
+# 示例2：Docker镜像
+docker|registry.example.com/large-docker:v1|pending|生产环境镜像
+docker|docker.io/nginx:latest|pending|测试nginx镜像
+# 已完成的任务（Runner自动标记，无需删除）
+general|https://old-file.iso|completed|成功，ReleaseTag：task-7-xxxx
+# 失败的任务（可改回pending续传）
+docker|registry.old.com/image:v2|failed|分卷15上传失败
