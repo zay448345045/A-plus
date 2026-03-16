@@ -25,7 +25,7 @@ jobs:
           echo "=== 清理后磁盘空间 ==="
           df -h
 
-      - name: 下载文件并获取实际文件名（极简方案）
+      - name: 下载文件并处理文件名（移除特殊字符）
 #        env:
 #          SP_COOKIE: ${{ secrets.git }}
         run: |
@@ -33,64 +33,72 @@ jobs:
           mkdir -p ./downloads && cd ./downloads
 
           # 下载链接
-          URL="https://f6.erista.me/files/Eggman%27s%20Arcade%20Repository/Sega/Sega%20RingEdge/maimai%20PiNK%20PLUS%20%28SDCQ%29/maimai%20PiNK%20PLUS%20%28SDCQ%29%201.70.00%20EXTEND%20%282016%29%28JPN%2CEXP%29%28unpacked%29.zip"
+          URL="https://github.com/mozilla/pdf.js-sample-files/raw/master/tracemonkey.pdf"
 
-          # 下载文件（-OJ 自动用服务器返回的文件名）
-          curl -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+          # 修复后的curl命令
+          curl -L -A "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
                -OJ -f -sS --show-error "$URL"
 
+          # 关键1：获取实际文件名，并清理特殊字符（%/空格/括号等）-H "Cookie: $SP_COOKIE" \
+          ACTUAL_FILENAME_RAW=$(ls -1)
+          # 清理规则：%→_、空格→_、括号→空、其他特殊字符保留
+          ACTUAL_FILENAME_CLEAN=$(echo "$ACTUAL_FILENAME_RAW" | sed -e 's/%/_/g' -e 's/ /_/g' -e 's/(/./g' -e 's/)/./g')
+          # 重命名下载的文件（避免特殊字符问题）
+          mv "$ACTUAL_FILENAME_RAW" "$ACTUAL_FILENAME_CLEAN"
 
-          # 关键：下载后直接读取实际文件名（无URL解码、无特殊字符处理）-H "Cookie: $SP_COOKIE" \
-          # 因为只下载1个文件，ls -1 直接获取唯一文件名
-          ACTUAL_FILENAME=$(ls -1)
-          # 去掉后缀作为分卷名（用shell变量写入文件，规避env上下文问题）
-          VOLUME_NAME="${ACTUAL_FILENAME%.*}"
+          # 关键2：用清理后的文件名作为分卷名
+          VOLUME_NAME="${ACTUAL_FILENAME_CLEAN%.*}"
           
-          # 把文件名写入临时文件（替代$GITHUB_ENV，彻底规避上下文解析错误）
-          echo "$ACTUAL_FILENAME" > ../actual_filename.txt
+          # 写入临时文件
+          echo "$ACTUAL_FILENAME_CLEAN" > ../actual_filename.txt
           echo "$VOLUME_NAME" > ../volume_name.txt
 
-          echo "✅ 下载完成，实际文件名：$ACTUAL_FILENAME"
+          echo "✅ 下载完成，原始文件名：$ACTUAL_FILENAME_RAW"
+          echo "✅ 清理后文件名：$ACTUAL_FILENAME_CLEAN"
           echo "✅ 分卷基础名：$VOLUME_NAME"
           ls -lh
 
-      - name: 分卷压缩（直接读取临时文件中的文件名）
+      - name: 分卷压缩（修复匹配逻辑）
         if: success()
         run: |
           set -euo pipefail
           cd ./downloads
 
-          # 从临时文件读取文件名（核心修复：避开env上下文）
+          # 读取清理后的文件名
           ACTUAL_FILENAME=$(cat ../actual_filename.txt)
           VOLUME_NAME=$(cat ../volume_name.txt)
 
-          # 检查文件存在性
+          # 检查文件存在性（用引号包裹，兼容特殊字符）
           if [ ! -f "$ACTUAL_FILENAME" ]; then
-            echo "❌ 源文件 $ACTUAL_FILENAME 不存在"
+            echo "❌ 源文件 '$ACTUAL_FILENAME' 不存在"
             exit 1
           fi
 
-          # 分卷压缩（直接用shell变量，无上下文问题）
+          # 分卷压缩（用清理后的文件名，无特殊字符）
           7z a -v1900m -mx0 "$VOLUME_NAME.7z" "$ACTUAL_FILENAME"
 
-          # 验证分卷
-          if [ $(ls -1 "$VOLUME_NAME.7z.*" 2>/dev/null | wc -l) -eq 0 ]; then
-            echo "❌ 分卷压缩失败"
+          # 修复：正确验证分卷（禁用通配符，用find命令匹配）
+          VOLUME_COUNT=$(find . -maxdepth 1 -name "$VOLUME_NAME.7z.*" -type f | wc -l)
+          if [ "$VOLUME_COUNT" -eq 0 ]; then
+            echo "❌ 分卷压缩失败：未找到分卷文件"
             exit 1
           fi
-          echo "✅ 分卷完成：$VOLUME_NAME.7z.*"
 
-      - name: 发布Release（读取临时文件中的分卷名）
+          echo "✅ 分卷完成：共生成 $VOLUME_COUNT 个分卷"
+          ls -lh "$VOLUME_NAME.7z."*
+
+      - name: 发布Release并上传分卷
         if: success()
         uses: softprops/action-gh-release@v2
         with:
-          # 用固定前缀+运行号做标签（避开特殊字符）
           tag_name: "maimai-file-v${{ github.run_number }}"
           name: "Maimai 文件发布 v${{ github.run_number }}"
           body: |
             ## 下载完成（自动分卷）
-            - 原始文件名：$(cat actual_filename.txt)
-            - 分卷文件：$(cat volume_name.txt).7z.*（每卷1900MB）
-            - 解压方式：下载所有分卷docker后，用7-Zip打开第一个.7z.001文件自动合并
-          # 上传分卷（读取临时文件中的分卷名）
-          files: ./downloads/$(cat volume_name.txt).7z.*
+            - 清理后文件名：$(cat actual_filename.txt)
+            - 分卷文件：$(cat volume_name.txt).7z.*（共 $(find ./downloads -name "$(cat volume_name.txt).7z.*" | wc -l) 卷，每卷1900MB）
+            - 解压方式：下载所有分卷后，用7-Zip打开第一个.7z.001文件自动合并解压
+          # 用find命令匹配分卷，避免通配符问题
+          files: |
+            ./downloads/$(cat volume_name.txt).7z.*
+#            ./downloads/$(cat volume_name.txt).7z.*
