@@ -26,8 +26,8 @@ jobs:
           df -h
 
       - name: 下载文件并获取实际文件名（极简方案）
-#        env:
-#          SP_COOKIE: ${{ secrets.git }}
+        env:
+          SP_COOKIE: ${{ secrets.git }}
         run: |
           set -euo pipefail
           mkdir -p ./downloads && cd ./downloads
