@@ -1,209 +1,96 @@
 name: docker npm published
 
-# 支持手动触发 + 可选定时触发（如需）
 on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: '文件HTTPS直链（支持ZIP/ISO等任意格式）'
+        description: '文件直链'
         required: true
         default: 'https://github.com/mozilla/pdf.js-sample-files/raw/master/tracemonkey.pdf'
       volume_size:
-        description: '分卷大小（建议1900m，接近GitHub 2GB限制）'
+        description: '分卷大小'
         required: false
         default: '1900m'
       compression_level:
-        description: '压缩级别（0=仅打包(快)，9=最高压缩(慢)）'
+        description: '压缩级别 0=最快'
         required: false
         default: '0'
-  # 可选：定时触发（每天凌晨1点执行，注释掉则仅手动触发）
-  # schedule:
-  #   - cron: '0 1 * * *'
 
 jobs:
   download_and_split:
     runs-on: ubuntu-latest
-    # 延长超时时间（默认360分钟=6小时，适配20GB大文件）
-    timeout-minutes: 720
+    timeout-minutes:720
     permissions:
-      contents: write  # 发布Release必需
-      actions: read     # 读取Action日志（可选）
+      contents: write
 
     steps:
-      - name: 步骤1 - 系统信息检查
+      - name: 清理磁盘
         run: |
-          echo "=== 系统基本信息 ==="
-          uname -a
-          echo "=== CPU核心数 ==="
-          nproc
-          echo "=== 内存大小 ==="
-          free -h
-          echo "=== 磁盘空间（清理前） ==="
-          df -h /
-
-      - name: 步骤2 - 极致清理磁盘空间（关键）
-        run: |
-          echo "=== 开始清理非必要文件 ==="
-          # 1. 删除大体积预装软件
-          sudo rm -rf /usr/local/* /opt/* /var/cache/apt/* /var/log/*
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /usr/lib/jvm /usr/share/man
-          # 2. 清理Docker残留（最大的空间占用）
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /var/cache/apt/archives /var/lib/docker
           sudo docker system prune -a -f --volumes
-          # 3. 清理APT缓存
-          sudo apt update && sudo apt autoremove -y && sudo apt clean -y
-          # 4. 删除临时文件
-          sudo rm -rf /tmp/* ~/.cache/*
-          
-          echo "=== 磁盘空间（清理后） ==="
           df -h /
-          # 检查可用空间，低于15GB则终止（适配20GB大文件分卷）
-          AVAILABLE_SPACE=$(df -h / | grep / | awk '{print $4}' | sed 's/G//g')
-          if (( $(echo "$AVAILABLE_SPACE < 15" | bc -l) )); then
-            echo "❌ 可用磁盘空间不足15GB，终止任务"
-            exit 1
-          fi
 
-      - name: 步骤3 - 流式下载+分卷（核心修复版）
+      - name: 下载 + 流式分卷（最终稳定版）
         id: download
         run: |
           set -euo pipefail
-          # 关键：临时禁用"非0退出码终止脚本"，处理7-Zip的92码
           set +e
 
-          # 创建工作目录
-          mkdir -p ./large_file && cd ./large_file || exit 1
+          mkdir -p large_file && cd large_file
 
-          # 定义输入变量（简化引用）
           FILE_URL="${{ github.event.inputs.file_url }}"
           VOLUME_SIZE="${{ github.event.inputs.volume_size }}"
-          COMPRESS_LEVEL="${{ github.event.inputs.compression_level }}"
+          COMPRESS="${{ github.event.inputs.compression_level }}"
 
-          # ========== 优化文件名清理（解决URL转义字符乱码） ==========
-          # 步骤1：解码URL转义字符（%20→空格、%28→( 等）
-          FILE_NAME_RAW=$(basename "$FILE_URL" | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read()))")
-          # 步骤2：精准清理特殊字符（仅保留字母、数字、._-，避免混乱）
-          FILE_NAME_CLEAN=$(echo "$FILE_NAME_RAW" | sed -E 's/[^a-zA-Z0-9._-]/_/g' | sed -E 's/_+/_/g' | sed -E 's/^_+|_+$//g')
-          VOLUME_BASE_NAME="${FILE_NAME_CLEAN%.*}"
-          FINAL_VOLUME_NAME="${VOLUME_BASE_NAME}_$(date +%Y%m%d_%H%M%S)" # 加时间戳避免重复
+          # 文件名处理
+          FILE_NAME_RAW=$(basename "$FILE_URL" | python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.stdin.read()))")
+          FILE_NAME_CLEAN=$(echo "$FILE_NAME_RAW" | sed -E 's/[^a-zA-Z0-9._-]/_/g' | sed -E 's/_+/_/g;s/^_//;s/_$//')
+          FINAL_VOLUME_NAME="${FILE_NAME_CLEAN%.*}_$(date +%Y%m%d_%H%M%S)"
 
-          # ========== 输出配置信息 ==========
-          echo "=== 下载配置 ==="
-          echo "源文件直链：$FILE_URL"
-          echo "原始文件名：$FILE_NAME_RAW"
-          echo "清理后文件名：$FILE_NAME_CLEAN"
-          echo "分卷基础名：$FINAL_VOLUME_NAME"
-          echo "分卷大小：$VOLUME_SIZE"
-          echo "压缩级别：$COMPRESS_LEVEL"
+          echo "=== 配置 ==="
+          echo "文件：$FILE_NAME_RAW"
+          echo "分卷：$FINAL_VOLUME_NAME"
 
-          # ========== 核心：流式下载+7z分卷（修复exit code 92） ==========
-          echo -e "\n=== 开始流式下载并分卷 ==="
-          # curl优化：增加--fail-fast、重试次数提升到5次，延迟10秒
-          curl -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
-               -s --progress-bar --retry 5 --retry-delay 10 --fail-fast "$FILE_URL" | \
-               7z a -v"$VOLUME_SIZE" -mx"$COMPRESS_LEVEL" -si "$FINAL_VOLUME_NAME.7z"
+          # 下载 + 分卷（无报错参数）
+          curl -L -A "Mozilla/5.0" \
+            --retry 5 --retry-delay 10 --fail \
+            "$FILE_URL" | \
+          7z a -v"$VOLUME_SIZE" -mx"$COMPRESS" -si "$FINAL_VOLUME_NAME.7z"
 
-          # 捕获7-Zip退出码（关键修复）
           7Z_EXIT_CODE=$?
-          # 仅在"非0且非92"时才真失败（92是分卷完成的警告，无需处理）
-          if [ $7Z_EXIT_CODE -ne 0 ] && [ $7Z_EXIT_CODE -ne 92 ]; then
-            echo "❌ 7-Zip分卷失败，退出码：$7Z_EXIT_CODE"
-            exit $7Z_EXIT_CODE
-          fi
-
-          # ========== 增强版分卷验证（避免空/无效分卷） ==========
-          echo -e "\n=== 验证分卷文件 ==="
-          VOLUME_FILES=$(find . -maxdepth 1 -name "$FINAL_VOLUME_NAME.7z.*" -type f | sort -V)
-          VOLUME_COUNT=$(echo "$VOLUME_FILES" | wc -l)
-
-          if [ "$VOLUME_COUNT" -eq 0 ]; then
-            echo "❌ 分卷失败：未生成任何分卷文件"
+          if [ $7Z_EXIT_CODE != 0 ] && [ $7Z_EXIT_CODE != 92 ]; then
+            echo "7z 失败 $7Z_EXIT_CODE"
             exit 1
           fi
 
-          # 验证每个分卷大小（排除空文件）
-          VALID_COUNT=0
-          MIN_SIZE=$(( $(echo "$VOLUME_SIZE" | sed 's/m//g') * 1024 * 1024 * 90 / 100 )) # 分卷大小的90%作为最小有效大小
-          for VOL_FILE in $VOLUME_FILES; do
-            FILE_SIZE=$(du -b "$VOL_FILE" | awk '{print $1}')
-            if [ "$FILE_SIZE" -gt "$MIN_SIZE" ] || [ "$VOL_FILE" = "$(echo "$VOLUME_FILES" | tail -1)" ]; then
-              echo "✅ 分卷$VOL_FILE：大小=$((FILE_SIZE/1024/1024))MB（有效）"
-              VALID_COUNT=$((VALID_COUNT + 1))
-            else
-              echo "❌ 分卷$VOL_FILE：大小=$((FILE_SIZE/1024/1024))MB（无效，删除）"
-              rm -f "$VOL_FILE"
-            fi
-          done
-
-          if [ "$VALID_COUNT" -eq 0 ]; then
-            echo "❌ 所有分卷文件无效，任务失败"
+          # 统计有效分卷
+          COUNT=$(ls -1 "$FINAL_VOLUME_NAME".7z.* 2>/dev/null | wc -l)
+          if [ $COUNT -eq 0 ]; then
+            echo "分卷失败"
             exit 1
           fi
 
-          # ========== 统计分卷信息 ==========
-          TOTAL_SIZE=$(du -hc $FINAL_VOLUME_NAME.7z.* 2>/dev/null | grep total | awk '{print $1}')
-          echo -e "\n✅ 分卷完成！"
-          echo "有效分卷数量：$VALID_COUNT 个"
-          echo "总大小：$TOTAL_SIZE"
-          echo "分卷列表："
-          ls -lh "$FINAL_VOLUME_NAME.7z."*
+          TOTAL=$(du -sh "$FINAL_VOLUME_NAME".7z.* | tail -n1 | awk '{print $1}')
 
-          # ========== 写入临时文件（供后续步骤使用） ==========
+          # 输出
           cd ..
-          echo "$FINAL_VOLUME_NAME" > ./volume_name.txt
-          echo "$VALID_COUNT" > ./volume_count.txt
-          echo "$TOTAL_SIZE" > ./total_size.txt
-          echo "$FILE_NAME_CLEAN" > ./file_name.txt
-          echo "$FILE_NAME_RAW" > ./raw_file_name.txt # 新增原始文件名，用于Release描述
+          echo "$FINAL_VOLUME_NAME" > volume_name.txt
+          echo "$COUNT" > volume_count.txt
+          echo "$TOTAL" > total_size.txt
+          echo "$FILE_NAME_CLEAN" > file_name.txt
+          echo "$FILE_NAME_RAW" > raw_file_name.txt
 
-          # ========== 设置输出变量（供后续步骤调用） ==========
           echo "volume_name=$FINAL_VOLUME_NAME" >> $GITHUB_OUTPUT
-          echo "valid_volume_count=$VALID_COUNT" >> $GITHUB_OUTPUT
-          echo "total_size=$TOTAL_SIZE" >> $GITHUB_OUTPUT
 
-          # 强制返回0（确保步骤标记为成功）
-          exit 0
-
-      - name: 步骤4 - 发布Release（上传所有分卷）
-        if: success()
+      - name: 上传到 Release
         uses: softprops/action-gh-release@v2
         with:
-          # Release标签（含时间戳，避免重复）
-          tag_name: "large-file-${{ steps.download.outputs.volume_name }}-${{ github.run_number }}"
-          # Release名称
-          name: "文件分卷 - ${{ steps.download.outputs.volume_name }} v${{ github.run_number }}"
-          # Release描述（详细信息）
+          tag_name: "file_${{ steps.download.outputs.volume_name }}_${{ github.run_id }}"
+          name: "分卷 ${{ steps.download.outputs.volume_name }}"
           body: |
-            ## 文件分卷发布完成
-            - 源文件直链：${{ github.event.inputs.file_url }}
-            - 原始文件名：$(cat raw_file_name.txt)
-            - 清理后文件名：$(cat file_name.txt)
-            - 分卷基础名：$(cat volume_name.txt)
-            - 有效分卷数量：$(cat volume_count.txt) 卷
-            - 单卷大小：${{ github.event.inputs.volume_size }}
-            - 分卷总大小：$(cat total_size.txt)
-            - 压缩级别：${{ github.event.inputs.compression_level }}（0=仅打包，9=最高压缩）
-            - 下载时间：${{ github.run_at }}
-            - Action运行ID：${{ github.run_id }}
-
-            ### 注意事项
-            - 分卷文件需全部下载后，用7-Zip解压第一个分卷即可自动合并
-            - 推荐使用7-Zip 23.01+版本解压，避免兼容性问题
-
-            ### 失败排查
-            - 若解压失败，请检查分卷文件是否完整下载
-            - 若分卷缺失，可重新触发Action下载
-          # 上传所有有效分卷文件（精准匹配）
+            源文件：$(cat raw_file_name.txt)
+            分卷：$(cat volume_name.txt)
+            数量：$(cat volume_count.txt)
+            总大小：$(cat total_size.txt)
           files: ./large_file/${{ steps.download.outputs.volume_name }}.7z.*
-          # 标记为最新Release
           make_latest: true
-
-      - name: 步骤5 - 失败通知（可选）
-        if: failure()
-        run: |
-          echo "❌ 文件分卷任务失败！"
-          echo "失败时间：$(date)"
-          echo "Action运行ID：${{ github.run_id }}"
-          echo "失败仓库：${{ github.repository }}"
-          echo "请检查日志：https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          # 可选：添加钉钉/企业微信/邮件通知（需配置Secrets）
-          # curl -X POST -H "Content-Type: application/json" -d '{"msgtype":"text","text":{"content":"【文件分卷失败】\n仓库：${{ github.repository }}\n运行ID：${{ github.run_id }}\n链接：https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}}' https://oapi.dingtalk.com/robot/send?access_token=${{ secrets.DINGTALK_TOKEN }}
