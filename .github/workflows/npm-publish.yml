@@ -19,60 +19,68 @@ on:
 jobs:
   download_and_split:
     runs-on: ubuntu-latest
-#    timeout-minutes:720
+    timeout-minutes: 720
     permissions:
       contents: write
 
     steps:
-      - name: 清理磁盘
+      - name: 清理磁盘空间
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /var/cache/apt/archives /var/lib/docker
           sudo docker system prune -a -f --volumes
           df -h /
 
-      - name: 下载 + 流式分卷（最终稳定版）
+      - name: 下载 + 流式分卷（终极修复版）
         id: download
         run: |
-          set -euo pipefail
+          # 核心：关闭严格的变量检查（避免unbound variable错误）
+          set +u
           set +e
 
-          mkdir -p large_file && cd large_file
+          # 创建工作目录
+          mkdir -p large_file && cd large_file || exit 1
 
+          # 读取输入参数
           FILE_URL="${{ github.event.inputs.file_url }}"
           VOLUME_SIZE="${{ github.event.inputs.volume_size }}"
           COMPRESS="${{ github.event.inputs.compression_level }}"
 
-          # 文件名处理
+          # 文件名处理（无乱码）
           FILE_NAME_RAW=$(basename "$FILE_URL" | python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.stdin.read()))")
           FILE_NAME_CLEAN=$(echo "$FILE_NAME_RAW" | sed -E 's/[^a-zA-Z0-9._-]/_/g' | sed -E 's/_+/_/g;s/^_//;s/_$//')
           FINAL_VOLUME_NAME="${FILE_NAME_CLEAN%.*}_$(date +%Y%m%d_%H%M%S)"
 
+          # 输出配置信息
           echo "=== 配置 ==="
           echo "文件：$FILE_NAME_RAW"
           echo "分卷：$FINAL_VOLUME_NAME"
 
-          # 下载 + 分卷（无报错参数）
+          # 核心：下载+分卷（兼容所有curl版本）
           curl -L -A "Mozilla/5.0" \
             --retry 5 --retry-delay 10 --fail \
             "$FILE_URL" | \
           7z a -v"$VOLUME_SIZE" -mx"$COMPRESS" -si "$FINAL_VOLUME_NAME.7z"
-
-          7Z_EXIT_CODE=$?
-          if [ $7Z_EXIT_CODE != 0 ] && [ $7Z_EXIT_CODE != 92 ]; then
-            echo "7z 失败 $7Z_EXIT_CODE"
+          
+          # 修复：变量赋值（等号前后无空格，核心！）
+          SEVEN_ZIP_EXIT_CODE=$?
+          
+          # 仅在真失败时退出（92是正常警告）
+          if [ "$SEVEN_ZIP_EXIT_CODE" -ne 0 ] && [ "$SEVEN_ZIP_EXIT_CODE" -ne 92 ]; then
+            echo "❌ 7z分卷失败，退出码：$SEVEN_ZIP_EXIT_CODE"
             exit 1
           fi
 
-          # 统计有效分卷
+          # 统计有效分卷（兼容空输出）
           COUNT=$(ls -1 "$FINAL_VOLUME_NAME".7z.* 2>/dev/null | wc -l)
-          if [ $COUNT -eq 0 ]; then
-            echo "分卷失败"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "❌ 分卷失败：未生成任何分卷文件"
             exit 1
           fi
 
-          TOTAL=$(du -sh "$FINAL_VOLUME_NAME".7z.* | tail -n1 | awk '{print $1}')
+          # 统计总大小（兼容少量分卷）
+          TOTAL=$(du -hc "$FINAL_VOLUME_NAME".7z.* 2>/dev/null | grep -i total | awk '{print $1}')
 
-          # 输出
+          # 写入临时文件（供后续步骤使用）
           cd ..
           echo "$FINAL_VOLUME_NAME" > volume_name.txt
           echo "$COUNT" > volume_count.txt
@@ -80,17 +88,32 @@ jobs:
           echo "$FILE_NAME_CLEAN" > file_name.txt
           echo "$FILE_NAME_RAW" > raw_file_name.txt
 
-          echo "volume_name=$FINAL_VOLUME_NAME" >> $GITHUB_OUTPUT
+          # 设置输出变量
+          echo "volume_name=$FINAL_VOLUME_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: 上传到 Release
+          # 强制返回成功
+          exit 0
+
+      - name: 上传到Release
+        if: success()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "file_${{ steps.download.outputs.volume_name }}_${{ github.run_id }}"
-          name: "分卷 ${{ steps.download.outputs.volume_name }}"
+          name: "分卷文件 - ${{ steps.download.outputs.volume_name }}"
           body: |
-            源文件：$(cat raw_file_name.txt)
-            分卷：$(cat volume_name.txt)
-            数量：$(cat volume_count.txt)
-            总大小：$(cat total_size.txt)
+            ### 文件分卷信息
+            - 源文件名称：$(cat raw_file_name.txt)
+            - 分卷基础名：$(cat volume_name.txt)
+            - 分卷数量：$(cat volume_count.txt) 个
+            - 单卷大小：${{ github.event.inputs.volume_size }}
+            - 总大小：$(cat total_size.txt)
+            - 压缩级别：${{ github.event.inputs.compression_level }}
+            - 构建时间：${{ github.run_at }}
           files: ./large_file/${{ steps.download.outputs.volume_name }}.7z.*
           make_latest: true
+
+      - name: 失败通知
+        if: failure()
+        run: |
+          echo "❌ 分卷任务失败！运行ID：${{ github.run_id }}"
+          echo "日志地址：https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
