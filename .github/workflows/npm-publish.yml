@@ -4,9 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: '文件直链'
+        description: '文件直链（每行一个）'  # 提示用户每行一个链接
         required: true
         default: 'https://github.com/mozilla/pdf.js-sample-files/raw/master/tracemonkey.pdf'
+        type: text  # 显式指定为文本类型，支持多行输入
       volume_size:
         description: '分卷大小'
         required: false
@@ -30,10 +31,10 @@ jobs:
           sudo docker system prune -a -f --volumes
           df -h /
 
-      - name: 下载 + 流式分卷（终极修复版）
+      - name: 批量下载 + 流式分卷
         id: download
         run: |
-          # 核心：关闭严格的变量检查（避免unbound variable错误）
+          # 核心：关闭严格的变量检查
           set +u
           set +e
 
@@ -41,55 +42,88 @@ jobs:
           mkdir -p large_file && cd large_file || exit 1
 
           # 读取输入参数
-          FILE_URL="${{ github.event.inputs.file_url }}"
+          FILE_URLS="${{ github.event.inputs.file_url }}"
           VOLUME_SIZE="${{ github.event.inputs.volume_size }}"
           COMPRESS="${{ github.event.inputs.compression_level }}"
-
-          # 文件名处理（无乱码）
-          FILE_NAME_RAW=$(basename "$FILE_URL" | python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.stdin.read()))")
-          FILE_NAME_CLEAN=$(echo "$FILE_NAME_RAW" | sed -E 's/[^a-zA-Z0-9._-]/_/g' | sed -E 's/_+/_/g;s/^_//;s/_$//')
-          FINAL_VOLUME_NAME="${FILE_NAME_CLEAN%.*}_$(date +%Y%m%d_%H%M%S)"
-
-          # 输出配置信息
-          echo "=== 配置 ==="
-          echo "文件：$FILE_NAME_RAW"
-          echo "分卷：$FINAL_VOLUME_NAME"
-
-          # 核心：下载+分卷（兼容所有curl版本）
-          curl -L -A "Mozilla/5.0" \
-            --retry 5 --retry-delay 10 --fail \
-            "$FILE_URL" | \
-          7z a -v"$VOLUME_SIZE" -mx"$COMPRESS" -si "$FINAL_VOLUME_NAME.7z"
           
-          # 修复：变量赋值（等号前后无空格，核心！）
-          SEVEN_ZIP_EXIT_CODE=$?
-          
-          # 仅在真失败时退出（92是正常警告）
-          if [ "$SEVEN_ZIP_EXIT_CODE" -ne 0 ] && [ "$SEVEN_ZIP_EXIT_CODE" -ne 92 ]; then
-            echo "❌ 7z分卷失败，退出码：$SEVEN_ZIP_EXIT_CODE"
+          # 初始化汇总信息
+          TOTAL_FILES=0
+          ALL_FILE_NAMES=""
+          SUMMARY=""
+
+          # 循环处理每个下载链接（按行分割）
+          while IFS= read -r FILE_URL; do
+            # 跳过空行
+            if [ -z "$FILE_URL" ]; then
+              continue
+            fi
+            TOTAL_FILES=$((TOTAL_FILES + 1))
+            
+            # 文件名处理（无乱码）
+            FILE_NAME_RAW=$(basename "$FILE_URL" | python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.stdin.read()))")
+            FILE_NAME_CLEAN=$(echo "$FILE_NAME_RAW" | sed -E 's/[^a-zA-Z0-9._-]/_/g' | sed -E 's/_+/_/g;s/^_//;s/_$//')
+            FINAL_VOLUME_NAME="${FILE_NAME_CLEAN%.*}_$(date +%Y%m%d_%H%M%S)_file${TOTAL_FILES}"
+
+            # 输出配置信息
+            echo "=== 处理文件 $TOTAL_FILES ==="
+            echo "文件：$FILE_NAME_RAW"
+            echo "分卷：$FINAL_VOLUME_NAME"
+
+            # 核心：下载+分卷（兼容所有curl版本）
+            curl -L -A "Mozilla/5.0" \
+              --retry 5 --retry-delay 10 --fail \
+              "$FILE_URL" | \
+            7z a -v"$VOLUME_SIZE" -mx"$COMPRESS" -si "$FINAL_VOLUME_NAME.7z"
+            
+            # 修复：变量赋值（等号前后无空格，核心！）
+            SEVEN_ZIP_EXIT_CODE=$?
+            
+            # 仅在真失败时退出（92是正常警告）
+            if [ "$SEVEN_ZIP_EXIT_CODE" -ne 0 ] && [ "$SEVEN_ZIP_EXIT_CODE" -ne 92 ]; then
+              echo "❌ 7z分卷失败（文件$TOTAL_FILES），退出码：$SEVEN_ZIP_EXIT_CODE"
+              exit 1
+            fi
+
+            # 统计有效分卷（兼容空输出）
+            COUNT=$(ls -1 "$FINAL_VOLUME_NAME".7z.* 2>/dev/null | wc -l)
+            if [ "$COUNT" -eq 0 ]; then
+              echo "❌ 分卷失败（文件$TOTAL_FILES）：未生成任何分卷文件"
+              exit 1
+            fi
+
+            # 统计总大小（兼容少量分卷）
+            FILE_TOTAL=$(du -hc "$FINAL_VOLUME_NAME".7z.* 2>/dev/null | grep -i total | awk '{print $1}')
+            
+            # 记录当前文件信息
+            ALL_FILE_NAMES+="$FINAL_VOLUME_NAME "
+            SUMMARY+="- 文件 $TOTAL_FILES：$FILE_NAME_RAW | 分卷数：$COUNT | 总大小：$FILE_TOTAL\n"
+
+            echo "✅ 文件$TOTAL_FILES 处理完成"
+          done <<< "$FILE_URLS"  # 按行读取所有链接
+
+          # 检查是否有成功处理的文件
+          if [ "$TOTAL_FILES" -eq 0 ]; then
+            echo "❌ 未找到有效的下载链接"
             exit 1
           fi
 
-          # 统计有效分卷（兼容空输出）
-          COUNT=$(ls -1 "$FINAL_VOLUME_NAME".7z.* 2>/dev/null | wc -l)
-          if [ "$COUNT" -eq 0 ]; then
-            echo "❌ 分卷失败：未生成任何分卷文件"
-            exit 1
-          fi
-
-          # 统计总大小（兼容少量分卷）
-          TOTAL=$(du -hc "$FINAL_VOLUME_NAME".7z.* 2>/dev/null | grep -i total | awk '{print $1}')
+          # 统计所有分卷的总大小
+          TOTAL_SIZE=$(du -hc *.7z.* 2>/dev/null | grep -i total | awk '{print $1}')
 
           # 写入临时文件（供后续步骤使用）
           cd ..
-          echo "$FINAL_VOLUME_NAME" > volume_name.txt
-          echo "$COUNT" > volume_count.txt
-          echo "$TOTAL" > total_size.txt
-          echo "$FILE_NAME_CLEAN" > file_name.txt
-          echo "$FILE_NAME_RAW" > raw_file_name.txt
+          echo "$ALL_FILE_NAMES" > volume_names.txt
+          echo "$TOTAL_FILES" > total_files_count.txt
+          echo "$TOTAL_SIZE" > total_size.txt
+          echo -e "$SUMMARY" > summary.txt
+          
+          # 生成统一的Release名称
+          RELEASE_NAME="批量分卷_$(date +%Y%m%d_%H%M%S)"
+          echo "$RELEASE_NAME" > release_name.txt
 
           # 设置输出变量
-          echo "volume_name=$FINAL_VOLUME_NAME" >> "$GITHUB_OUTPUT"
+          echo "release_name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
+          echo "total_files=$TOTAL_FILES" >> "$GITHUB_OUTPUT"
 
           # 强制返回成功
           exit 0
@@ -98,22 +132,23 @@ jobs:
         if: success()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "file_${{ steps.download.outputs.volume_name }}_${{ github.run_id }}"
-          name: "分卷文件 - ${{ steps.download.outputs.volume_name }}"
+          tag_name: "batch_${{ steps.download.outputs.release_name }}_${{ github.run_id }}"
+          name: "批量分卷文件 - ${{ steps.download.outputs.release_name }}"
           body: |
-            ### 文件分卷信息
-            - 源文件名称：$(cat raw_file_name.txt)
-            - 分卷基础名：$(cat volume_name.txt)
-            - 分卷数量：$(cat volume_count.txt) 个
+            ### 批量分卷汇总信息
+            - 处理文件总数：$(cat total_files_count.txt) 个
             - 单卷大小：${{ github.event.inputs.volume_size }}
-            - 总大小：$(cat total_size.txt)
+            - 所有文件总大小：$(cat total_size.txt)
             - 压缩级别：${{ github.event.inputs.compression_level }}
             - 构建时间：${{ github.run_at }}
-          files: ./large_file/${{ steps.download.outputs.volume_name }}.7z.*
+
+            ### 单个文件详情
+            $(cat summary.txt)
+          files: ./large_file/*.7z.*  # 上传所有分卷文件
           make_latest: true
 
       - name: 失败通知
         if: failure()
         run: |
-          echo "❌ 分卷任务失败！运行ID：${{ github.run_id }}"
+          echo "❌ 批量分卷任务失败！运行ID：${{ github.run_id }}"
           echo "日志地址：https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
