@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: '文件直链（每行一个）'  # 提示用户每行一个链接
+        description: '文件直链（多个链接用逗号隔开）'  # 提示改为逗号分隔
         required: true
         default: 'https://github.com/mozilla/pdf.js-sample-files/raw/master/tracemonkey.pdf'
-        type: text  # 显式指定为文本类型，支持多行输入
+        type: text
       volume_size:
         description: '分卷大小'
         required: false
@@ -31,7 +31,7 @@ jobs:
           sudo docker system prune -a -f --volumes
           df -h /
 
-      - name: 批量下载 + 流式分卷
+      - name: 批量下载 + 流式分卷（逗号分隔版）
         id: download
         run: |
           # 核心：关闭严格的变量检查
@@ -42,7 +42,7 @@ jobs:
           mkdir -p large_file && cd large_file || exit 1
 
           # 读取输入参数
-          FILE_URLS="${{ github.event.inputs.file_url }}"
+          FILE_URLS_STR="${{ github.event.inputs.file_url }}"
           VOLUME_SIZE="${{ github.event.inputs.volume_size }}"
           COMPRESS="${{ github.event.inputs.compression_level }}"
           
@@ -51,9 +51,14 @@ jobs:
           ALL_FILE_NAMES=""
           SUMMARY=""
 
-          # 循环处理每个下载链接（按行分割）
-          while IFS= read -r FILE_URL; do
-            # 跳过空行
+          # 将逗号分隔的字符串拆分为数组（兼容逗号前后有空格的情况）
+          # 先替换 ", " 为 ",", 再按 "," 分割
+          FILE_URLS_CLEAN=$(echo "$FILE_URLS_STR" | sed 's/, /,/g')
+          IFS=',' read -ra FILE_URLS_ARRAY <<< "$FILE_URLS_CLEAN"
+
+          # 循环处理每个下载链接
+          for FILE_URL in "${FILE_URLS_ARRAY[@]}"; do
+            # 跳过空链接（比如末尾多打了逗号的情况）
             if [ -z "$FILE_URL" ]; then
               continue
             fi
@@ -68,6 +73,7 @@ jobs:
             echo "=== 处理文件 $TOTAL_FILES ==="
             echo "文件：$FILE_NAME_RAW"
             echo "分卷：$FINAL_VOLUME_NAME"
+            echo "链接：$FILE_URL"
 
             # 核心：下载+分卷（兼容所有curl版本）
             curl -L -A "Mozilla/5.0" \
@@ -99,7 +105,7 @@ jobs:
             SUMMARY+="- 文件 $TOTAL_FILES：$FILE_NAME_RAW | 分卷数：$COUNT | 总大小：$FILE_TOTAL\n"
 
             echo "✅ 文件$TOTAL_FILES 处理完成"
-          done <<< "$FILE_URLS"  # 按行读取所有链接
+          done
 
           # 检查是否有成功处理的文件
           if [ "$TOTAL_FILES" -eq 0 ]; then
