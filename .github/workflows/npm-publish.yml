@@ -31,6 +31,171 @@ jobs:
           sudo docker system prune -a -f --volumes
           df -h /
 
+      - name: 批量下载 + 流式分卷（修复字符超限）
+        id: download
+        run: |
+          set +u
+          set +e
+
+          # 创建工作目录
+          mkdir -p large_file && cd large_file || exit 1
+
+          # 读取输入参数
+          FILE_URLS_STR="${{ github.event.inputs.file_url }}"
+          VOLUME_SIZE="${{ github.event.inputs.volume_size }}"
+          COMPRESS="${{ github.event.inputs.compression_level }}"
+          
+          # 初始化汇总信息
+          TOTAL_FILES=0
+          ALL_FILE_NAMES=""
+          SUMMARY=""
+          SOURCE_FILE_NAMES=""
+          # 新增：简短标识（用于Tag/标题）
+          SHORT_ID="batch_$(date +%Y%m%d_%H%M%S)"
+
+          # 将逗号分隔的字符串拆分为数组
+          FILE_URLS_CLEAN=$(echo "$FILE_URLS_STR" | sed 's/, /,/g')
+          IFS=',' read -ra FILE_URLS_ARRAY <<< "$FILE_URLS_CLEAN"
+
+          # 循环处理每个下载链接
+          for FILE_URL in "${FILE_URLS_ARRAY[@]}"; do
+            [ -z "$FILE_URL" ] && continue
+            TOTAL_FILES=$((TOTAL_FILES + 1))
+            
+            # 文件名处理
+            FILE_NAME_RAW=$(basename "$FILE_URL" | python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.stdin.read()))")
+            FILE_NAME_CLEAN=$(echo "$FILE_NAME_RAW" | sed -E 's/[^a-zA-Z0-9._-]/_/g;s/_+/_/g;s/^_//;s/_$//')
+            FINAL_VOLUME_NAME="${FILE_NAME_CLEAN%.*}_$(date +%Y%m%d_%H%M%S)_file${TOTAL_FILES}"
+
+            # 输出配置信息
+            echo "=== 处理文件 $TOTAL_FILES ==="
+            echo "文件：$FILE_NAME_RAW"
+            echo "分卷：$FINAL_VOLUME_NAME"
+
+            # 核心：下载+分卷
+            curl -L -A "Mozilla/5.0" \
+              --retry 5 --retry-delay 10 --fail \
+              "$FILE_URL" | \
+            7z a -v"$VOLUME_SIZE" -mx"$COMPRESS" -si "$FINAL_VOLUME_NAME.7z"
+            
+            SEVEN_ZIP_EXIT_CODE=$?
+            if [ "$SEVEN_ZIP_EXIT_CODE" -ne 0 ] && [ "$SEVEN_ZIP_EXIT_CODE" -ne 92 ]; then
+              echo "❌ 7z分卷失败（文件$TOTAL_FILES），退出码：$SEVEN_ZIP_EXIT_CODE"
+              exit 1
+            fi
+
+            # 统计有效分卷
+            COUNT=$(ls -1 "$FINAL_VOLUME_NAME".7z.* 2>/dev/null | wc -l)
+            if [ "$COUNT" -eq 0 ]; then
+              echo "❌ 分卷失败（文件$TOTAL_FILES）：未生成任何分卷文件"
+              exit 1
+            fi
+
+            # 统计总大小
+            FILE_TOTAL=$(du -hc "$FINAL_VOLUME_NAME".7z.* 2>/dev/null | grep -i total | awk '{print $1}')
+            
+            # 记录信息
+            ALL_FILE_NAMES+="$FINAL_VOLUME_NAME "
+            SUMMARY+="- 文件 $TOTAL_FILES：$FILE_NAME_RAW | 分卷数：$COUNT | 总大小：$FILE_TOTAL\n"
+            SOURCE_FILE_NAMES+="$FILE_NAME_RAW|" # 保留原始文件名，用于正文展示
+
+            echo "✅ 文件$TOTAL_FILES 处理完成"
+          done
+
+          # 检查是否有成功处理的文件
+          if [ "$TOTAL_FILES" -eq 0 ]; then
+            echo "❌ 未找到有效的下载链接"
+            exit 1
+          fi
+
+          # 统计所有分卷的总大小
+          TOTAL_SIZE=$(du -hc *.7z.* 2>/dev/null | grep -i total | awk '{print $1}')
+
+          # 写入临时文件
+          cd ..
+          echo "$ALL_FILE_NAMES" > volume_names.txt
+          echo "$TOTAL_FILES" > total_files_count.txt
+          echo "$TOTAL_SIZE" > total_size.txt
+          echo -e "$SUMMARY" > summary.txt
+          echo "${SOURCE_FILE_NAMES%|}" > source_file_names.txt # 去掉最后一个|
+          
+          # 生成简短的Release名称/标签（核心修复：控制长度）
+          RELEASE_NAME="批量分卷_${TOTAL_FILES}个文件_$(date +%Y%m%d_%H%M%S)"
+          RELEASE_TAG="batch_${SHORT_ID}_${{ github.run_id }}"
+
+          # 写入临时文件
+          echo "$RELEASE_NAME" > release_name.txt
+          echo "$RELEASE_TAG" > release_tag.txt
+
+          # 设置输出变量
+          echo "release_name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "total_files=$TOTAL_FILES" >> "$GITHUB_OUTPUT"
+
+          exit 0
+
+      - name: 上传到Release（修复字符超限）
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          # 修复1：使用简短Tag（控制在256字符内）
+          tag_name: ${{ steps.download.outputs.release_tag }}
+          # 修复2：使用简短名称（控制在256字符内）
+          name: ${{ steps.download.outputs.release_name }}
+          body: |
+            ### 批量分卷汇总信息
+            - 处理文件总数：$(cat total_files_count.txt) 个
+            - 单卷大小：${{ github.event.inputs.volume_size }}
+            - 所有文件总大小：$(cat total_size.txt)
+            - 压缩级别：${{ github.event.inputs.compression_level }}
+            - 构建时间：${{ github.run_at }}
+
+            ### 所有源文件名称（完整列表）
+            $(cat source_file_names.txt | tr '|' '\n' | awk '{print "- "$0}')
+
+            ### 单个文件分卷详情
+            $(cat summary.txt)
+          files: ./large_file/*.7z.*
+          make_latest: true
+          overwrite: true # 允许覆盖同名Tag（可选）
+
+      - name: 失败通知
+        if: failure()
+        run: |
+          echo "❌ 批量分卷任务失败！运行ID：${{ github.run_id }}"
+          echo "日志地址：https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}": docker npm published
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: '文件直链（多个链接用逗号隔开）'
+        required: true
+        default: 'https://github.com/mozilla/pdf.js-sample-files/raw/master/tracemonkey.pdf'
+        type: text
+      volume_size:
+        description: '分卷大小'
+        required: false
+        default: '1900m'
+      compression_level:
+        description: '压缩级别 0=最快'
+        required: false
+        default: '0'
+
+jobs:
+  download_and_split:
+    runs-on: ubuntu-latest
+    timeout-minutes: 720
+    permissions:
+      contents: write
+
+    steps:
+      - name: 清理磁盘空间
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /var/cache/apt/archives /var/lib/docker
+          sudo docker system prune -a -f --volumes
+          df -h /
+
       - name: 批量下载 + 流式分卷（逗号分隔版）
         id: download
         run: |
