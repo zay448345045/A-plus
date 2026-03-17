@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: '文件直链（多个链接用逗号隔开）'  # 提示改为逗号分隔
+        description: '文件直链（多个链接用逗号隔开）'
         required: true
         default: 'https://github.com/mozilla/pdf.js-sample-files/raw/master/tracemonkey.pdf'
         type: text
@@ -50,9 +50,10 @@ jobs:
           TOTAL_FILES=0
           ALL_FILE_NAMES=""
           SUMMARY=""
+          # 新增：存储源文件名称（用于Release标题）
+          SOURCE_FILE_NAMES=""
 
           # 将逗号分隔的字符串拆分为数组（兼容逗号前后有空格的情况）
-          # 先替换 ", " 为 ",", 再按 "," 分割
           FILE_URLS_CLEAN=$(echo "$FILE_URLS_STR" | sed 's/, /,/g')
           IFS=',' read -ra FILE_URLS_ARRAY <<< "$FILE_URLS_CLEAN"
 
@@ -103,6 +104,8 @@ jobs:
             # 记录当前文件信息
             ALL_FILE_NAMES+="$FINAL_VOLUME_NAME "
             SUMMARY+="- 文件 $TOTAL_FILES：$FILE_NAME_RAW | 分卷数：$COUNT | 总大小：$FILE_TOTAL\n"
+            # 新增：拼接源文件名称（用于Release）
+            SOURCE_FILE_NAMES+="$FILE_NAME_CLEAN|"
 
             echo "✅ 文件$TOTAL_FILES 处理完成"
           done
@@ -122,14 +125,17 @@ jobs:
           echo "$TOTAL_FILES" > total_files_count.txt
           echo "$TOTAL_SIZE" > total_size.txt
           echo -e "$SUMMARY" > summary.txt
+          # 新增：写入源文件名称到临时文件
+          echo "${SOURCE_FILE_NAMES%|}" > source_file_names.txt # 去掉最后一个|
           
-          # 生成统一的Release名称
-          RELEASE_NAME="批量分卷_$(date +%Y%m%d_%H%M%S)"
+          # 生成统一的Release名称（融入源文件名）
+          RELEASE_NAME="$(echo ${SOURCE_FILE_NAMES%|} | cut -c1-50)_$(date +%Y%m%d_%H%M%S)" # 截断过长名称
           echo "$RELEASE_NAME" > release_name.txt
 
-          # 设置输出变量
+          # 设置输出变量（新增源文件名）
           echo "release_name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
           echo "total_files=$TOTAL_FILES" >> "$GITHUB_OUTPUT"
+          echo "source_file_names=${SOURCE_FILE_NAMES%|}" >> "$GITHUB_OUTPUT"
 
           # 强制返回成功
           exit 0
@@ -138,11 +144,14 @@ jobs:
         if: success()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "batch_${{ steps.download.outputs.release_name }}_${{ github.run_id }}"
-          name: "批量分卷文件 - ${{ steps.download.outputs.release_name }}"
+          # 改动1：Tag融入源文件名+时间+运行ID，更直观
+          tag_name: "file_${{ steps.download.outputs.source_file_names }}_${{ github.run_id }}"
+          # 改动2：Release标题明确显示源文件名+分卷标识
+          name: "分卷文件 - ${{ steps.download.outputs.source_file_names }} (${{ steps.download.outputs.total_files }}个文件)"
           body: |
             ### 批量分卷汇总信息
             - 处理文件总数：$(cat total_files_count.txt) 个
+            - 源文件名称：$(cat source_file_names.txt)
             - 单卷大小：${{ github.event.inputs.volume_size }}
             - 所有文件总大小：$(cat total_size.txt)
             - 压缩级别：${{ github.event.inputs.compression_level }}
@@ -150,7 +159,7 @@ jobs:
 
             ### 单个文件详情
             $(cat summary.txt)
-          files: ./large_file/*.7z.*  # 上传所有分卷文件
+          files: ./large_file/*.7z.*
           make_latest: true
 
       - name: 失败通知
