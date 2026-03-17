@@ -59,9 +59,9 @@ jobs:
           gh release create "$RELEASE_TAG" \
             --title "$RELEASE_NAME" \
             --notes "### 批量分卷流式上传中...
-- 开始时间：$(date +%Y-%m-%d\ %H:%M:%S)
-- 已处理文件：0
-- 成功：0 | 失败：0" \
+            - 开始时间：$(date +%Y-%m-%d\ %H:%M:%S)
+          - 已处理文件：0
+          - 成功：0 | 失败：0" \
             --draft  # 先设为草稿，避免提前公开
 
           # 处理链接：移除末尾多余逗号 + 拆分数组
@@ -147,28 +147,27 @@ jobs:
 
             # 实时更新Release备注（展示进度）
             gh release edit "$RELEASE_TAG" --notes "### 批量分卷流式上传中...
-- 开始时间：$(date +%Y-%m-%d\ %H:%M:%S)
-- 总文件数：$TOTAL_COUNT
-- 已处理：$TOTAL_FILES | 成功：$SUCCESS_FILES | 失败：$FAIL_FILES
-
-### 处理详情（实时更新）
-$SUMMARY"
+            - 开始时间：$(date +%Y-%m-%d\ %H:%M:%S)
+            - 总文件数：$TOTAL_COUNT
+            - 已处理：$TOTAL_FILES | 成功：$SUCCESS_FILES | 失败：$FAIL_FILES
+          ### 处理详情（实时更新）
+                  $SUMMARY"
           done
 
           # 最终更新Release：标记为正式版 + 完整统计
           echo -e "\n=== 所有文件处理完成 ==="
           gh release edit "$RELEASE_TAG" --notes "### 批量分卷流式上传完成
-- 开始时间：$(date +%Y-%m-%d\ %H:%M:%S)
-- 结束时间：$(date +%Y-%m-%d\ %H:%M:%S)
-- 总文件数：$TOTAL_COUNT
-- 成功处理：$SUCCESS_FILES | 失败/跳过：$FAIL_FILES
+          - 开始时间：$(date +%Y-%m-%d\ %H:%M:%S)
+          - 结束时间：$(date +%Y-%m-%d\ %H:%M:%S)
+          - 总文件数：$TOTAL_COUNT
+          - 成功处理：$SUCCESS_FILES | 失败/跳过：$FAIL_FILES
 
-### 详细处理结果
-$SUMMARY
+          ### 详细处理结果
+          $SUMMARY
 
-### 关键说明
-✅ 所有成功文件已上传至Release，本地文件已删除（节省磁盘空间）
-⚠️ 失败文件可核对链接后重新运行" --draft=false
+          ### 关键说明
+           ✅ 所有成功文件已上传至Release，本地文件已删除（节省磁盘空间）
+           ⚠️ 失败文件可核对链接后重新运行" --draft=false
 
           # 输出关键结果（供后续步骤使用）
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
