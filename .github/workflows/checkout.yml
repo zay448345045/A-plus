@@ -25,7 +25,7 @@ jobs:
 
     steps:
       - name: 1. 极致轻量化检出
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: checkout     # 存放 urls.txt 的专用分支
           fetch-depth: 1
