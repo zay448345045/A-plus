@@ -1,99 +1,105 @@
-name: check out
+name: checkout
 
 on:
   workflow_dispatch:
     inputs:
-      file_urls:
-        description: '填写链接 (多个用逗号隔开；若留空则读取仓库 urls.txt)'
-        required: false
       current_index:
         description: '起始索引 (从第几个链接开始)'
         required: true
         default: '0'
       batch_size:
-        description: '每轮处理的文件数量 (建议 5-10)'
+        description: '每轮尝试处理的文件数量'
         required: true
-        default: '10'
+        default: '5'
       volume_size:
         description: '分卷大小 (如 1900m)'
         required: false
         default: '1900m'
 
 jobs:
-  harvest_relay:
+  relay_harvest:
     runs-on: ubuntu-latest
     permissions:
       contents: write
       actions: write
 
     steps:
-      - name: 1. 极致轻量化检出
-        uses: actions/checkout@v4
+      - name: 1. 极致轻量化检出 (checkout 分支)
+        uses: actions/checkout@v6
         with:
-          ref: checkout     # 忠诚于你的专用分支
+          ref: checkout     # 存放 urls.txt 的专用分支
           fetch-depth: 1
 
-      - name: 2. 战术空间清理 (Tactical Space Expansion)
+      - name: 2. 战术空间清理
         run: |
-          echo "=== 初始空间 ==="
-          df -h /
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost
           sudo docker image prune --all --force
-          echo "=== 清理后空间 ==="
+          echo "=== 初始清理后可用空间 ==="
           df -h /
 
-      - name: 3. 执行分段流式处理
-        id: engine
+      - name: 3. 执行分段流式收割
+        id: worker
         run: |
           mkdir -p ./stage_zone
           
-          # [逻辑借鉴]：解析链接列表
-          if [ -n "${{ github.event.inputs.file_urls }}" ]; then
-            echo "${{ github.event.inputs.file_urls }}" | sed 's/,/\n/g' > all_urls.txt
-          else
-            if [ -f "urls.txt" ]; then
-              cp urls.txt all_urls.txt
-            else
-              echo "❌ 错误：未发现输入链接，且仓库中无 urls.txt"
-              exit 1
-            fi
+          # 读取链接清单
+          if [ ! -f "urls.txt" ]; then
+            echo "❌ 错误：在 checkout 分支未发现 urls.txt"
+            exit 1
           fi
 
           START=${{ github.event.inputs.current_index }}
           SIZE=${{ github.event.inputs.batch_size }}
-          TOTAL=$(cat all_urls.txt | wc -l)
-          NEXT=$((START + SIZE))
+          TOTAL=$(cat urls.txt | wc -l)
+          NEXT_LIMIT=$((START + SIZE))
           
-          echo "Task Progress: $START to $((NEXT-1)) of $TOTAL"
+          echo "Task: $START to $((NEXT_LIMIT-1)) / Total: $TOTAL"
 
-          # [核心逻辑]：提取本轮需要处理的链接行
-          sed -n "$((START+1)),${NEXT}p" all_urls.txt > current_batch.txt
+          # 提取本轮目标链接
+          sed -n "$((START+1)),${NEXT_LIMIT}p" urls.txt > current_batch.txt
+          
+          processed_in_this_run=0
           
           while read -r URL; do
             [ -z "$URL" ] && continue
-            # 文件名清洗 (Python 处理防止特殊字符报错)
+            
+            # --- 核心：实时空间水位监控 (借鉴 V4 Python 逻辑) ---
+            FREE_MB=$(df -m / | awk 'NR==2 {print $4}')
+            if [ "$FREE_MB" -lt 5120 ]; then # 剩余小于 5GB 强制断点
+              echo "⚠️ [空间熔断] 磁盘仅剩 ${FREE_MB}MB，触碰安全红线，正在紧急收尾..."
+              break
+            fi
+            # -----------------------------------------------
+
+            # 文件名清洗
             FILE_NAME=$(basename "$URL" | python3 -c "import urllib.parse, sys; print(urllib.parse.unquote(sys.stdin.read()).split('?')[0])")
             SAFE_NAME=$(echo "$FILE_NAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
             
-            echo "🚀 Streaming: $SAFE_NAME"
-            # 边下边压，不留原始大文件在磁盘
+            echo "🚀 正在流式切片: $SAFE_NAME (剩余空间: ${FREE_MB}MB)"
+            
+            # 流式下载并分卷压入 stage_zone
+            # 使用 -mx0 保证不占 CPU，只做物理切片
             curl -L -A "Mozilla/5.0" --retry 3 --fail "$URL" | \
             7z a -v"${{ github.event.inputs.volume_size }}" -mx0 -si "./stage_zone/$SAFE_NAME.7z"
+            
+            processed_in_this_run=$((processed_in_this_run + 1))
           done < current_batch.txt
 
-          # [接力判断]：是否需要触发下一轮
-          if [ $NEXT -lt $TOTAL ]; then
+          # 计算下一轮真实的起始索引
+          ACTUAL_NEXT=$((START + processed_in_this_run))
+          echo "next_idx=$ACTUAL_NEXT" >> $GITHUB_OUTPUT
+          
+          if [ $ACTUAL_NEXT -lt $TOTAL ]; then
             echo "should_relay=true" >> $GITHUB_OUTPUT
-            echo "next_idx=$NEXT" >> $GITHUB_OUTPUT
           else
             echo "should_relay=false" >> $GITHUB_OUTPUT
           fi
           
-          echo "processed_count=$(ls ./stage_zone | wc -l)" >> $GITHUB_OUTPUT
+          echo "count=$(ls ./stage_zone | wc -l)" >> $GITHUB_OUTPUT
 
       - name: 4. 资产归档至 Release (softprops)
         uses: softprops/action-gh-release@v2
-        if: always() && steps.engine.outputs.processed_count != '0'
+        if: always() && steps.worker.outputs.count != '0'
         with:
           tag_name: "relay-vault-v4"
           name: "无限接力资源库 V4"
@@ -102,22 +108,19 @@ jobs:
           body: |
             ---
             ### 📥 自动接力记录 (起始索引: ${{ github.event.inputs.current_index }})
-            - **完成区间**: ${{ github.event.inputs.current_index }} -> ${{ steps.engine.outputs.next_idx }}
+            - **完成区间**: ${{ github.event.inputs.current_index }} -> ${{ steps.worker.outputs.next_idx }}
             - **时间**: $(date)
-            - **状态**: 阶段性任务成功，已上传分卷。
+            - **状态**: 已成功上传分卷
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 5. 自动化接力启动 (Self-Triggering)
-        if: steps.engine.outputs.should_relay == 'true'
+      - name: 5. 自动化接力信号 (Self-Triggering)
+        if: steps.worker.outputs.should_relay == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          NEXT_INDEX=${{ steps.engine.outputs.next_idx }}
-          echo "🚀 发现接力信号，正在启动下一轮任务 (Next: $NEXT_INDEX)..."
-          # 自动触发当前 Workflow，传入更新后的索引
+          echo "🚀 发现未完任务，正在启动下一轮接力 (Index: ${{ steps.worker.outputs.next_idx }})..."
           gh workflow run "${{ github.workflow }}" \
-            -f current_index=$NEXT_INDEX \
+            -f current_index=${{ steps.worker.outputs.next_idx }} \
             -f batch_size=${{ github.event.inputs.batch_size }} \
-            -f volume_size=${{ github.event.inputs.volume_size }} \
-            -f file_urls="${{ github.event.inputs.file_urls }}"
+            -f volume_size=${{ github.event.inputs.volume_size }}
