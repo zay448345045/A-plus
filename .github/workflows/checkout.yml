@@ -112,7 +112,11 @@ jobs:
           
           echo "count=$(ls ./stage_zone | wc -l)" >> $GITHUB_OUTPUT
       - name: 检查文件是否存在
-        run: ls -R ./stage_zone/
+      
+        run: |
+         pwd
+         find ./stage_zone -maxdepth 2
+         ls -R ./stage_zone/
       - name: 4. 资产归档至 Release (强制执行版)
         uses: softprops/action-gh-release@v2
         # 去掉了 count 检查，只要运行到这里就尝试上传
