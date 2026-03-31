@@ -46,13 +46,22 @@ jobs:
           mkdir -p ./stage_zone
           #        id: worker
           #        run: |
-          
-          
-          # 读取链接清单
-          if [ ! -f "urls.txt" ]; then
+          # --- 新增：处理逗号分隔的单行文件 ---
+          if [ -f "urls.txt" ]; then
+            # 把逗号替换为换行，并覆盖原文件
+            sed -i 's/,/\n/g' urls.txt
+            # 清理一下可能存在的空行
+            sed -i '/^$/d' urls.txt
+          else
             echo "❌ 错误：在 checkout 分支未发现 urls.txt"
             exit 1
-          fi
+          fi          
+          
+          # 读取链接清单
+          #if [ ! -f "urls.txt" ]; then
+          #  echo "❌ 错误：在 checkout 分支未发现 urls.txt"
+          #  exit 1
+          $fi
 
           START=${{ github.event.inputs.current_index }}
           SIZE=${{ github.event.inputs.batch_size }}
