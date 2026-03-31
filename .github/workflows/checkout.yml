@@ -1,4 +1,4 @@
-name: checkout
+name: Arcade Relay V4
 
 on:
   workflow_dispatch:
@@ -27,7 +27,7 @@ jobs:
       - name: 1. 检出资源清单
         uses: actions/checkout@v6
         with:
-          ref: checkout     # 确保你的 urls.txt 在这个分支
+          ref: checkout     # 确保 urls.txt 在此分支
           fetch-depth: 1
 
       - name: 2. 极致空间清理
@@ -36,94 +36,88 @@ jobs:
           sudo docker image prune --all --force
           df -h /
 
-      - name: 3. 执行智能分段收割
+      - name: 3. 执行流式收割 (移植成功版逻辑)
         id: worker
         run: |
-          # --- 核心：移植成功脚本的鲁棒性设置 ---
-          set +e  # 允许部分步骤非致命报错继续执行
+          # 核心：允许非致命错误，防止中途崩掉导致 stage_zone 为空
+          set +e
           
           mkdir -p ./stage_zone
           
-          # 处理链接清单 (支持逗号或换行)
-          if [ -f "urls.txt" ]; then
-            sed -i 's/,/\n/g' urls.txt
-            sed -i 's/\r//g' urls.txt
-            sed -i '/^$/d' urls.txt
-          else
-            echo "❌ 错误：未发现 urls.txt"
-            exit 1
-          fi
+          # 清洗 urls.txt (处理逗号、回车符、空行)
+          sed -i 's/,/\n/g' urls.txt
+          sed -i 's/\r//g' urls.txt
+          sed -i '/^$/d' urls.txt
 
           START=${{ github.event.inputs.current_index }}
           SIZE=${{ github.event.inputs.batch_size }}
           TOTAL=$(cat urls.txt | wc -l)
           
-          # 提取本轮目标链接
+          # 提取本轮要处理的链接
           sed -n "$((START+1)),$((START+SIZE))p" urls.txt > current_batch.txt
           
-          processed_this_run=0
+          processed_count=0
           
           while read -r URL; do
             [ -z "$URL" ] && continue
             
-            # 文件名清洗与唯一化 (参考成功脚本逻辑)
-            FILE_NAME_RAW=$(basename "$URL" | python3 -c "import urllib.parse, sys; print(urllib.parse.unquote(sys.stdin.read()).split('?')[0])")
-            FILE_NAME_CLEAN=$(echo "$FILE_NAME_RAW" | sed -E 's/[^a-zA-Z0-9._-]/_/g' | sed -E 's/_+/_/g;s/^_//;s/_$//')
+            # 移除 URL 首尾可能存在的隐形空格
+            CLEAN_URL=$(echo "$URL" | xargs)
             
-            # 增加时间戳和文件序号，彻底避免 Release 资产冲突
-            FINAL_BASE="${FILE_NAME_CLEAN}_$(date +%m%d%H%M)_idx${processed_this_run}"
+            # 文件名清洗 (确保无特殊字符且唯一)
+            FILE_NAME_RAW=$(basename "$CLEAN_URL" | python3 -c "import urllib.parse, sys; print(urllib.parse.unquote(sys.stdin.read()).split('?')[0])")
+            SAFE_NAME=$(echo "$FILE_NAME_RAW" | sed -E 's/[^a-zA-Z0-9._-]/_/g' | sed -E 's/_+/_/g;s/^_//;s/_$//')
             
-            echo "🚀 正在流式处理: $FILE_NAME_RAW"
+            # 加上时间戳，防止 Release 资产重名冲突
+            FINAL_BASE="${SAFE_NAME}_$(date +%m%d%H%M)"
+            
+            echo "🚀 正在处理 ($((processed_count+1))/$SIZE): $FILE_NAME_RAW"
 
-            # 执行流式下载 + 7z 分卷 (移植成功脚本的参数)
-            curl -L -A "Mozilla/5.0" --retry 5 --retry-delay 10 --fail "$URL" | \
+            # 核心管道：下载 -> 7z 分卷 (必须用双引号包裹 URL)
+            curl -L -A "Mozilla/5.0" --retry 5 --retry-delay 10 --fail "$CLEAN_URL" | \
             7z a -v"${{ github.event.inputs.volume_size }}" -mx0 -si "./stage_zone/${FINAL_BASE}.7z"
             
-            SEVEN_ZIP_EXIT_CODE=$?
-            
-            # 验证分卷是否成功 (检查 .7z.001 是否存在)
+            # 检查是否有分卷文件产生 (.001)
             if ls ./stage_zone/${FINAL_BASE}.7z.* 1>/dev/null 2>&1; then
-              echo "✅ $FINAL_BASE 分卷成功"
-              processed_this_run=$((processed_this_run + 1))
+              echo "✅ $FINAL_BASE 打包成功"
+              processed_count=$((processed_count + 1))
             else
-              echo "⚠️ $FINAL_BASE 处理异常，退出码: $SEVEN_ZIP_EXIT_CODE"
+              echo "❌ $FINAL_BASE 处理失败，请检查链接"
             fi
             
-            # 空间熔断保护
+            # 实时磁盘检查：如果剩下不到 3GB，强制停止并触发接力
             FREE_MB=$(df -m / | awk 'NR==2 {print $4}')
             if [ "$FREE_MB" -lt 3072 ]; then 
-              echo "⚠️ 空间不足，强制断点接力"
+              echo "⚠️ 磁盘空间吃紧 (${FREE_MB}MB)，提前结束本轮。"
               break
             fi
           done < current_batch.txt
 
-          # 计算下一次索引并输出变量
-          ACTUAL_NEXT=$((START + processed_this_run))
+          # 输出变量给后续步骤
+          ACTUAL_NEXT=$((START + processed_count))
           echo "next_idx=$ACTUAL_NEXT" >> $GITHUB_OUTPUT
           [ $ACTUAL_NEXT -lt $TOTAL ] && echo "should_relay=true" >> $GITHUB_OUTPUT || echo "should_relay=false" >> $GITHUB_OUTPUT
           
-          # 恢复严格模式
           set -e
 
-      - name: 4. 资产归档至 Release
+      - name: 4. 资产发布 (精确匹配分卷)
         uses: softprops/action-gh-release@v2
         if: always()
         with:
           tag_name: "relay-vault-v4"
           name: "无限接力资源库 V4"
-          # 关键：必须包含最后的通配符 .* 以匹配分卷后缀 .001, .002
+          # 注意：最后的 .* 是匹配 .001, .002 的关键
           files: ./stage_zone/*.7z.*
           append_body: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 5. 自动化接力触发
+      - name: 5. 自动触发下一轮接力
         if: always() && steps.worker.outputs.should_relay == 'true'
         run: |
-          echo "🏁 本轮结束，准备触发索引: ${{ steps.worker.outputs.next_idx }}"
+          echo "🏁 本轮结束。总链接数: $(cat urls.txt | wc -l), 下一站索引: ${{ steps.worker.outputs.next_idx }}"
           gh workflow run "${{ github.workflow }}" \
             -f current_index=${{ steps.worker.outputs.next_idx }} \
-            -f batch_size=${{ github.event.inputs.batch_size }} \
-            -f volume_size=${{ github.event.inputs.volume_size }}
+            -f batch_size=${{ github.event.inputs.batch_size }}
         env:
           GH_TOKEN: ${{ github.token }}
