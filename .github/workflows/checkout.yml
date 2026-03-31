@@ -24,8 +24,8 @@ jobs:
       actions: write
 
     steps:
-      - name: 1. 极致轻量化检出 (checkout 分支)
-        uses: actions/checkout@v6
+      - name: 1. 极致轻量化检出
+        uses: actions/checkout@v4
         with:
           ref: checkout     # 存放 urls.txt 的专用分支
           fetch-depth: 1
@@ -34,99 +34,89 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost
           sudo docker image prune --all --force
-          echo "=== 初始清理后可用空间 ==="
+          echo "=== 清理后磁盘水位 ==="
           df -h /
 
-      - name: 3. 执行分段流式收割
-        id: checkout
+      - name: 3. 执行智能分流收割
+        id: worker
         run: |
-          #ls -R          # 👈 加上这一行，看看当前目录下到底有些什么文件
-          cat urls.txt    # 👈 加上这一行，看看能不能打印出链接
-          # ...剩下的代码保持不变
-          mkdir -p ./stage_zone
-          #        id: worker
-          #        run: |
-          # --- 新增：处理逗号分隔的单行文件 ---
+          # --- 预处理 urls.txt ---
           if [ -f "urls.txt" ]; then
-            # 把逗号替换为换行，并覆盖原文件
             sed -i 's/,/\n/g' urls.txt
-            # 清理一下可能存在的空行
             sed -i '/^$/d' urls.txt
+            # 移除 Windows 换行符 \r
+            sed -i 's/\r//g' urls.txt
           else
-            echo "❌ 错误：在 checkout 分支未发现 urls.txt"
+            echo "❌ 错误：未发现 urls.txt"
             exit 1
-          fi          
-          
-          # 读取链接清单
-          #if [ ! -f "urls.txt" ]; then
-          #  echo "❌ 错误：在 checkout 分支未发现 urls.txt"
-          #  exit 1
-          $fi
+          fi
 
+          mkdir -p ./stage_zone
+          
           START=${{ github.event.inputs.current_index }}
           SIZE=${{ github.event.inputs.batch_size }}
           TOTAL=$(cat urls.txt | wc -l)
           NEXT_LIMIT=$((START + SIZE))
           
-          echo "Task: $START to $((NEXT_LIMIT-1)) / Total: $TOTAL"
-
-          # 提取本轮目标链接
+          echo "Task Scope: $START to $((NEXT_LIMIT-1)) / Total: $TOTAL"
           sed -n "$((START+1)),${NEXT_LIMIT}p" urls.txt > current_batch.txt
           
-          processed_in_this_run=0
-          
+          processed_count=0
+          THRESHOLD=524288000 # 500MB 阈值
+
           while read -r URL; do
             [ -z "$URL" ] && continue
             
-            # --- 核心：实时空间水位监控 (借鉴 V4 Python 逻辑) ---
+            # 清理 URL 字符串
+            CLEAN_URL=$(echo "$URL" | xargs)
+            
+            # 1. 预读文件大小
+            CONTENT_LENGTH=$(curl -sI -L "$CLEAN_URL" | grep -i 'Content-Length' | awk '{print $2}' | tr -d '\r' || echo "0")
+            [ -z "$CONTENT_LENGTH" ] && CONTENT_LENGTH=0
+
+            # 2. 生成安全文件名
+            FILE_NAME=$(python3 -c "import urllib.parse, sys; print(urllib.parse.unquote('$CLEAN_URL').split('/')[-1].split('?')[0])")
+            SAFE_NAME=$(echo "$FILE_NAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
+
+            # 3. 空间监控
             FREE_MB=$(df -m / | awk 'NR==2 {print $4}')
-            if [ "$FREE_MB" -lt 5120 ]; then # 剩余小于 5GB 强制断点
-              echo "⚠️ [空间熔断] 磁盘仅剩 ${FREE_MB}MB，触碰安全红线，正在紧急收尾..."
+            if [ "$FREE_MB" -lt 3072 ]; then # 剩余少于 3GB 强制熔断
+              echo "⚠️ [空间红线] 磁盘仅剩 ${FREE_MB}MB，跳过后续任务..."
               break
             fi
-            # -----------------------------------------------
 
-            # 文件名清洗
-            FILE_NAME=$(basename "$URL" | python3 -c "import urllib.parse, sys; print(urllib.parse.unquote(sys.stdin.read()).split('?')[0])")
-            SAFE_NAME=$(echo "$FILE_NAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
-            
-            echo "🚀 正在流式切片: $SAFE_NAME (剩余空间: ${FREE_MB}MB)"
-            
-            # 流式下载并分卷压入 stage_zone
-            # 使用 -mx0 保证不占 CPU，只做物理切片
-            curl -L -A "Mozilla/5.0" --retry 3 --fail "$URL" | \
-            7z a -v"${{ github.event.inputs.volume_size }}" -mx0 -si "./stage_zone/$SAFE_NAME.7z"
-            
-            processed_in_this_run=$((processed_in_this_run + 1))
+            echo "🔎 处理资源: $SAFE_NAME (大小: $CONTENT_LENGTH Bytes)"
+
+            if [ "$CONTENT_LENGTH" -gt 0 ] && [ "$CONTENT_LENGTH" -lt "$THRESHOLD" ]; then
+              # --- 🟢 稳健模式：针对小文件 (如你遇到的 20MB 文件) ---
+              echo "🚀 模式：[本地预载] -> [7z 打包]"
+              if curl -L -A "Mozilla/5.0" --retry 3 --fail -o "tmp_file" "$CLEAN_URL"; then
+                7z a -v"${{ github.event.inputs.volume_size }}" -mx0 "./stage_zone/${SAFE_NAME}.7z" "tmp_file"
+                rm -f "tmp_file"
+                processed_count=$((processed_count + 1))
+              fi
+            else
+              # --- 🔵 流式模式：针对大文件 (如 SDHD 镜像) ---
+              echo "🚀 模式：[管道切片] -> [7z -si]"
+              set -o pipefail
+              if curl -L -A "Mozilla/5.0" --retry 3 --fail "$CLEAN_URL" | \
+                 7z a -v"${{ github.event.inputs.volume_size }}" -mx0 -si "./stage_zone/${SAFE_NAME}.7z"; then
+                processed_count=$((processed_count + 1))
+              else
+                echo "❌ 流式任务失败: $SAFE_NAME"
+              fi
+              set +o pipefail
+            fi
           done < current_batch.txt
 
-          # 计算下一轮真实的起始索引
-          ACTUAL_NEXT=$((START + processed_in_this_run))
+          # 输出统计结果
+          ACTUAL_NEXT=$((START + processed_count))
           echo "next_idx=$ACTUAL_NEXT" >> $GITHUB_OUTPUT
-          
-          if [ $ACTUAL_NEXT -lt $TOTAL ]; then
-            echo "should_relay=true" >> $GITHUB_OUTPUT
-          else
-            echo "should_relay=false" >> $GITHUB_OUTPUT
-          fi
-          
-          echo "count=$(ls ./stage_zone | wc -l)" >> $GITHUB_OUTPUT
-      - name: 检查文件是否存在
-      
-        run: |
-         pwd
-         find ./stage_zone -maxdepth 2
-         ls -R ./stage_zone/
-      - name: 确保目录不为空
-        run: |
-         if [ -z "$(ls -A ./stage_zone/)" ]; then
-         echo "Error: stage_zone is empty!"
-         exit 1
-         fi
-      - name: 4. 资产归档至 Release (强制执行版)
+          echo "should_relay=$([ $ACTUAL_NEXT -lt $TOTAL ] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+
+      - name: 4. 资产验证与发布
         uses: softprops/action-gh-release@v2
-        # 去掉了 count 检查，只要运行到这里就尝试上传
-        if: always() 
+        if: always()
         with:
           tag_name: "relay-vault-v4"
           name: "无限接力资源库 V4"
@@ -135,23 +125,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 5. 自动化接力信号 (强制触发逻辑)
-        # 只要不是手动点错，就尝试触发下一轮
-        if: always()
+      - name: 5. 自动触发接力
+        if: always() && steps.worker.outputs.should_relay == 'true'
         run: |
-          # 重新计算一次，确保万无一失
-          NEXT_IDX=$(( ${{ github.event.inputs.current_index }} + ${{ github.event.inputs.batch_size }} ))
-          TOTAL_COUNT=$(cat urls.txt | wc -l)
-          
-          echo "🏁 本轮结束。总数: $TOTAL_COUNT, 下一站: $NEXT_IDX"
-          
-          if [ "$NEXT_IDX" -lt "$TOTAL_COUNT" ]; then
-            echo "🚀 启动下一轮接力..."
-            gh workflow run "${{ github.workflow }}" \
-              -f current_index=$NEXT_IDX \
-              -f batch_size=${{ github.event.inputs.batch_size }}
-          else
-            echo "✅ 所有链接已处理完毕，收工！"
-          fi
+          echo "🏁 触发下一阶段索引: ${{ steps.worker.outputs.next_idx }}"
+          gh workflow run "${{ github.workflow }}" \
+            -f current_index=${{ steps.worker.outputs.next_idx }} \
+            -f batch_size=${{ github.event.inputs.batch_size }} \
+            -f volume_size=${{ github.event.inputs.volume_size }}
         env:
           GH_TOKEN: ${{ github.token }}
