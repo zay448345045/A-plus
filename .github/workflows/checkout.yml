@@ -117,6 +117,12 @@ jobs:
          pwd
          find ./stage_zone -maxdepth 2
          ls -R ./stage_zone/
+      - name: 确保目录不为空
+        run: |
+         if [ -z "$(ls -A ./stage_zone/)" ]; then
+         echo "Error: stage_zone is empty!"
+         exit 1
+         fi
       - name: 4. 资产归档至 Release (强制执行版)
         uses: softprops/action-gh-release@v2
         # 去掉了 count 检查，只要运行到这里就尝试上传
@@ -124,7 +130,7 @@ jobs:
         with:
           tag_name: "relay-vault-v4"
           name: "无限接力资源库 V4"
-          files: ./stage_zone/*
+          files: ./stage_zone/**
           append_body: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
