@@ -4,17 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: '文件直链（多个链接用逗号隔开，支持超长字符串）'
+        description: '文件直链（多个链接用逗号隔开）'
         required: true
         default: 'https://github.com/mozilla/pdf.js-sample-files/raw/master/tracemonkey.pdf'
-        type: string  # GitHub Actions 合法类型（替代错误的text）
+        type: string
       volume_size:
-        description: '分卷大小（如1900m、2g，建议1900m适配GitHub磁盘）'
+        description: '分卷大小（如1900m、2g）'
         required: false
         default: '1900m'
         type: string
       compression_level:
-        description: '压缩级别（0=最快，9=最优，建议0节省时间）'
+        description: '压缩级别（0=最快，9=最优）'
         required: false
         default: 0
         type: number
@@ -22,179 +22,101 @@ on:
 jobs:
   download_split_stream_upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 1440  # 24小时超时（适配49+文件批量处理）
+    timeout-minutes: 1440
     permissions:
-      contents: write  # 授予Release上传权限
+      contents: write
 
     steps:
-      - name: 1. 清理磁盘空间（释放更多可用空间）
+      - name: 1. 清理磁盘空间
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /var/cache/apt/archives /var/lib/docker
           sudo docker system prune -a -f --volumes
-          sudo apt clean && sudo apt autoremove -y
-          echo "=== 磁盘空间清理后状态 ==="
           df -h /
 
-      - name: 2. 流式下载+分卷+实时上传（核心逻辑）
+      - name: 2. 流式下载+分卷+实时上传
         id: core
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +u
           set +e
 
-          # 初始化基础变量
           mkdir -p large_file && cd large_file || exit 1
+          
           FILE_URLS_STR="${{ github.event.inputs.file_url }}"
           VOLUME_SIZE="${{ github.event.inputs.volume_size }}"
           COMPRESS="${{ github.event.inputs.compression_level }}"
+          REPO="${{ github.repository }}"
+          
           TOTAL_FILES=0
           SUCCESS_FILES=0
           FAIL_FILES=0
           SUMMARY=""
-          # 生成简短唯一的Release Tag/名称（避免字符超限）
           RELEASE_TAG="stream_upload_$(date +%Y%m%d_%H%M%S)_${{ github.run_id }}"
           RELEASE_NAME="批量分卷_流式上传_$(date +%Y%m%d)"
 
-          # 第一步：初始化空的Draft Release（用于后续追加文件）
           echo "=== 初始化空Release ==="
+          # 关键点：添加 --repo 参数
           gh release create "$RELEASE_TAG" \
             --title "$RELEASE_NAME" \
-            --notes "### 批量分卷流式上传中...
-            - 开始时间：$(date +%Y-%m-%d\ %H:%M:%S)
-          - 已处理文件：0
-          - 成功：0 | 失败：0" \
-            --draft  # 先设为草稿，避免提前公开
+            --notes "### 任务启动..." \
+            --draft \
+            --repo "$REPO"
 
-          # 处理链接：移除末尾多余逗号 + 拆分数组
           FILE_URLS_CLEAN=$(echo "$FILE_URLS_STR" | sed 's/,$//' | sed 's/, /,/g')
           IFS=',' read -ra FILE_URLS_ARRAY <<< "$FILE_URLS_CLEAN"
           TOTAL_COUNT=${#FILE_URLS_ARRAY[@]}
-          echo "=== 开始处理 $TOTAL_COUNT 个文件 ==="
 
-          # 循环处理每个文件（核心流式逻辑）
           for FILE_URL in "${FILE_URLS_ARRAY[@]}"; do
             TOTAL_FILES=$((TOTAL_FILES + 1))
-            echo -e "\n=== 处理文件 $TOTAL_FILES/$TOTAL_COUNT ==="
-            
-            # 跳过空链接（兼容末尾多余逗号）
-            if [ -z "$FILE_URL" ]; then
-              echo "❌ 空链接，跳过"
-              FAIL_FILES=$((FAIL_FILES + 1))
-              SUMMARY+="- 文件 $TOTAL_FILES：空链接 | 状态：跳过\n"
-              continue
+            if [ -z "$FILE_URL" ]; then continue; fi
+
+            # 针对 SWH 链接优化：尝试从 URL 或参数中提取更好的文件名
+            # 如果链接包含 filename=，则优先提取它
+            FILE_NAME_RAW=$(echo "$FILE_URL" | grep -oP 'filename%3D%22\K[^%22]+' | sed 's/%22//g' || echo "file_$TOTAL_FILES")
+            if [ -z "$FILE_NAME_RAW" ]; then
+                FILE_NAME_RAW=$(basename "${FILE_URL%%\?*}")
             fi
+            
+            FILE_NAME_CLEAN=$(echo "$FILE_NAME_RAW" | sed -E 's/[^a-zA-Z0-9._-]/_/g')
+            VOLUME_BASE_NAME="${FILE_NAME_CLEAN}_part"
 
-            # 处理文件名：URL解码 + 清理特殊字符（避免7z/gh命令报错）
-            FILE_NAME_RAW=$(basename "$FILE_URL" | python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.stdin.read()))")
-            FILE_NAME_CLEAN=$(echo "$FILE_NAME_RAW" | sed -E 's/[^a-zA-Z0-9._-]/_/g;s/_+/_/g;s/^_//;s/_$//')
-            VOLUME_BASE_NAME="${FILE_NAME_CLEAN}_file${TOTAL_FILES}"
+            echo "🚀 处理文件：$FILE_NAME_RAW"
 
-            echo "📄 原始文件名：$FILE_NAME_RAW"
-            echo "🔧 清理后文件名：$VOLUME_BASE_NAME"
-            echo "🔗 下载链接：$FILE_URL"
-
-            # 核心：流式下载 → 实时压缩分卷（不保存完整文件）
-            echo "🚀 开始流式下载+分卷..."
-            curl -L -A "Mozilla/5.0" \
-              --retry 3 --retry-delay 5 --fail --show-error --silent \
-              "$FILE_URL" | \
+            # 流式下载并分卷
+            curl -L -A "Mozilla/5.0" --retry 3 "$FILE_URL" | \
             7z a -v"$VOLUME_SIZE" -mx"$COMPRESS" -si "$VOLUME_BASE_NAME.7z"
             
-            # 检查分卷结果（7z退出码92是正常警告，非错误）
-            SEVEN_ZIP_EXIT_CODE=$?
-            if [ "$SEVEN_ZIP_EXIT_CODE" -ne 0 ] && [ "$SEVEN_ZIP_EXIT_CODE" -ne 92 ]; then
-              echo "❌ 7z分卷失败，退出码：$SEVEN_ZIP_EXIT_CODE"
-              FAIL_FILES=$((FAIL_FILES + 1))
-              SUMMARY+="- 文件 $TOTAL_FILES：$FILE_NAME_RAW | 状态：分卷失败（退出码$SEVEN_ZIP_EXIT_CODE）\n"
-              continue
-            fi
-
-            # 统计分卷数量（验证是否生成分卷文件）
             VOLUME_COUNT=$(ls -1 "$VOLUME_BASE_NAME".7z.* 2>/dev/null | wc -l)
             if [ "$VOLUME_COUNT" -eq 0 ]; then
-              echo "❌ 未检测到分卷文件"
-              FAIL_FILES=$((FAIL_FILES + 1))
-              SUMMARY+="- 文件 $TOTAL_FILES：$FILE_NAME_RAW | 状态：无分卷文件\n"
-              continue
+               FAIL_FILES=$((FAIL_FILES + 1))
+               continue
             fi
 
-            # 流式上传：逐个上传分卷文件 → 上传成功后立即删除（释放磁盘）
-            echo "📤 开始上传分卷文件（共$VOLUME_COUNT个）..."
             UPLOAD_FAIL=0
             for VOL_FILE in "$VOLUME_BASE_NAME".7z.*; do
-              if [ -f "$VOL_FILE" ]; then
-                # 上传分卷文件到Release
-                gh release upload "$RELEASE_TAG" "$VOL_FILE" --clobber || {
-                  echo "❌ 上传$VOL_FILE失败"
-                  UPLOAD_FAIL=1
-                  break
-                }
-                # 上传成功后删除本地文件（核心：节省磁盘空间）
-                rm -f "$VOL_FILE"
-                echo "🗑️ 已删除本地文件：$VOL_FILE"
-              fi
+              # 关键点：上传时添加 --repo 参数
+              gh release upload "$RELEASE_TAG" "$VOL_FILE" --clobber --repo "$REPO" || { UPLOAD_FAIL=1; break; }
+              rm -f "$VOL_FILE"
             done
 
-            # 检查上传结果
-            if [ "$UPLOAD_FAIL" -eq 1 ]; then
-              echo "❌ 文件$TOTAL_FILES上传失败"
-              FAIL_FILES=$((FAIL_FILES + 1))
-              SUMMARY+="- 文件 $TOTAL_FILES：$FILE_NAME_RAW | 分卷数：$VOLUME_COUNT | 状态：上传失败\n"
-            else
-              echo "✅ 文件$TOTAL_FILES处理完成（上传+本地删除）"
+            if [ "$UPLOAD_FAIL" -eq 0 ]; then
               SUCCESS_FILES=$((SUCCESS_FILES + 1))
-              SUMMARY+="- 文件 $TOTAL_FILES：$FILE_NAME_RAW | 分卷数：$VOLUME_COUNT | 状态：成功\n"
+              SUMMARY+="- ✅ $FILE_NAME_RAW (分卷: $VOLUME_COUNT)\n"
+            else
+              FAIL_FILES=$((FAIL_FILES + 1))
+              SUMMARY+="- ❌ $FILE_NAME_RAW (上传失败)\n"
             fi
 
-            # 实时更新Release备注（展示进度）
-            gh release edit "$RELEASE_TAG" --notes "### 批量分卷流式上传中...
-            - 开始时间：$(date +%Y-%m-%d\ %H:%M:%S)
-            - 总文件数：$TOTAL_COUNT
-            - 已处理：$TOTAL_FILES | 成功：$SUCCESS_FILES | 失败：$FAIL_FILES
-          ### 处理详情（实时更新）
-                  $SUMMARY"
+            # 实时更新进度
+            gh release edit "$RELEASE_TAG" --notes "### 进度：$TOTAL_FILES / $TOTAL_COUNT \n$SUMMARY" --repo "$REPO"
           done
 
-          # 最终更新Release：标记为正式版 + 完整统计
-          echo -e "\n=== 所有文件处理完成 ==="
-          gh release edit "$RELEASE_TAG" --notes "### 批量分卷流式上传完成
-          - 开始时间：$(date +%Y-%m-%d\ %H:%M:%S)
-          - 结束时间：$(date +%Y-%m-%d\ %H:%M:%S)
-          - 总文件数：$TOTAL_COUNT
-          - 成功处理：$SUCCESS_FILES | 失败/跳过：$FAIL_FILES
+          # 发布 Release
+          gh release edit "$RELEASE_TAG" --draft=false --repo "$REPO"
 
-          ### 详细处理结果
-          $SUMMARY
-
-          ### 关键说明
-           ✅ 所有成功文件已上传至Release，本地文件已删除（节省磁盘空间）
-           ⚠️ 失败文件可核对链接后重新运行" --draft=false
-
-          # 输出关键结果（供后续步骤使用）
+          # 输出结果给后续 Step
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "total_files=$TOTAL_COUNT" >> "$GITHUB_OUTPUT"
           echo "success_files=$SUCCESS_FILES" >> "$GITHUB_OUTPUT"
           echo "fail_files=$FAIL_FILES" >> "$GITHUB_OUTPUT"
-
-          # 清理残留文件（双重保障）
-          rm -rf ../large_file/*
-          exit 0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # 自动注入的GitHub令牌，无需手动配置
-
-      - name: 3. 失败清理（任务失败时删除临时Release）
-        if: failure()
-        run: |
-          echo "❌ 任务执行失败，清理临时Release..."
-          gh release delete ${{ steps.core.outputs.release_tag }} --yes || true
-          rm -rf large_file/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 4. 输出最终结果
-        run: |
-          echo -e "\n========================================"
-          echo "✅ 任务执行完成！"
-          echo "📦 Release地址：https://github.com/${{ github.repository }}/releases/tag/${{ steps.core.outputs.release_tag }}"
-          echo "📊 统计结果：总文件${{ steps.core.outputs.total_files }} | 成功${{ steps.core.outputs.success_files }} | 失败${{ steps.core.outputs.fail_files }}"
-          echo "💡 所有成功文件已上传，本地文件已删除（无磁盘残留）"
-          echo "========================================"
