@@ -1,85 +1,94 @@
-name: Export ALL Status Action Logs (Full Scan)
+name: "🚀 Actions 物理日志全量存档"
 
 on:
-  workflow_dispatch: # 手动触发
+#  schedule:
+    # 每周一凌晨 0:00 自动运行一次 (UTC 时间)
+#    - cron: '0 0 * * 1'
+  workflow_dispatch:
+    # 支持手动触发，方便你现在立刻运行
+    inputs:
+      reason:
+        description: '手动触发原因'
+        required: false
+        default: '手动抢救近期日志'
 
 jobs:
-  export-all-status:
+  backup-and-upload:
     runs-on: ubuntu-latest
     permissions:
-      actions: read
-      contents: write
-
+      contents: write  # 必须开启写入权限以创建 Release
+    
     steps:
-      - name: Checkout
+      - name: "🛒 检出仓库"
         uses: actions/checkout@v6
         with:
           ref: checkout
           fetch-depth: 1
-      - name: Fetch and Package All Logs (Success & Failure)
+      - name: "🛠️ 执行备份脚本"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p all-repo-logs
-          echo "正在全量检索仓库内所有 Action 运行记录..."
-
-          # 1. 核心改进：不限制 status，直接获取所有已完成的任务
-          # 这样会包含 success, failure, cancelled, skipped, timed_out 等所有状态
-          # --limit 1000 是 GitHub CLI 的单次抓取上限
-          run_ids=$(gh run list --limit 1000 --json databaseId,status,workflowName --jq '.[] | select(.status=="completed") | .databaseId')
-
-          if [ -z "$run_ids" ]; then
-            echo "未找到任何已完成的运行记录。"
+          echo "正在全量检索仓库内所有已完成的任务记录..."
+          
+          # 获取最近 1000 条记录的元数据
+          run_data=$(gh run list --limit 1000 --json databaseId,status,workflowName,conclusion --jq '.[] | select(.status=="completed")')
+          
+          if [ -z "$run_data" ]; then
+            echo "未找到任何已完成的记录。"
             exit 0
           fi
 
-          echo "开始分类下载日志..."
-
-          for id in $run_ids; do
-            # 跳过当前的这个备份任务
+          # 循环处理每个 ID
+          echo "$run_data" | jq -c '.' | while read -r item; do
+            id=$(echo "$item" | jq -r '.databaseId')
+            # 跳过当前的备份任务
             if [ "$id" == "$GITHUB_RUN_ID" ]; then continue; fi
             
-            # 获取元数据：工作流名称和运行状态
-            metadata=$(gh run view $id --json workflowName,conclusion --jq '"\(.workflowName | gsub(" "; "_"))_\(.conclusion)"')
+            wf_name=$(echo "$item" | jq -r '.workflowName | gsub(" "; "_")')
+            conclusion=$(echo "$item" | jq -r '.conclusion')
             
-            echo "正在处理 Run ID: $id (状态: $metadata)"
-            
-            # 创建带状态标识的文件夹：例如 "Build_Android_failure/run-12345"
-            target_dir="all-repo-logs/${metadata}/run-$id"
+            target_dir="all-repo-logs/${wf_name}_${conclusion}/run-$id"
             mkdir -p "$target_dir"
             
-            # 执行下载。若日志已物理过期，gh 会报错，我们捕获并清理空目录
-            if ! gh run download $id --dir "$target_dir"; then
-              echo "Run ID $id 日志已过期，无法抓取。"
+            echo "▶️ 正在处理: [$conclusion] $wf_name (ID: $id)"
+            
+            # 使用 --log 抓取文本日志，避开已过期的 Artifacts 限制
+            if gh run view "$id" --log > "$target_dir/console_execution.log" 2>/dev/null; then
+              if [ ! -s "$target_dir/console_execution.log" ]; then
+                rm -rf "$target_dir"
+              fi
+            else
               rm -rf "$target_dir"
             fi
           done
 
-          # 2. 清理因过期产生的残留空目录
+          # 清理并打包
           find all-repo-logs -type d -empty -delete
-
-          # 3. 统计并打包
+          
           if [ -z "$(ls -A all-repo-logs)" ]; then
-            echo "没有可抓取的有效物理日志（可能全部已超过90天保留期）。"
-            exit 1
+            echo "没有可抓取的有效文本日志。"
+            exit 0
           fi
 
-          zip_name="full-status-logs-$(date +'%Y%m%d').zip"
-          zip -r "$zip_name" all-repo-logs/
+          zip_name="logs-archive-$(date +'%Y%m%d-%H%M').zip"
+          zip -r -q "$zip_name" all-repo-logs/
           
+          # 传递变量给后续步骤
           echo "ZIP_FILE=$zip_name" >> $GITHUB_ENV
-          echo "TAG_NAME=all-status-logs-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_ENV
+          echo "TAG_NAME=logs-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_ENV
 
-      - name: Create Release with Softprops
+      - name: "📦 发布至 Release (永久存档)"
+        if: env.ZIP_FILE != ''
         uses: softprops/action-gh-release@v2
-        if: success()
         with:
           tag_name: ${{ env.TAG_NAME }}
-          name: "全状态Action日志汇总 - ${{ env.TAG_NAME }}"
+          name: "日志自动存档: $(date +'%Y-%m-%d %H:%M')"
           body: |
-            ### 🛠 导出报告
-            - **包含状态**: 成功(Success)、失败(Failure)、已取消(Cancelled)等。
-            - **覆盖范围**: 仓库内所有 `.yml` 配置文件。
-            - **数量上限**: 最近 1000 条记录。
-            - **注意**: 若文件夹内无内容，说明该记录已超过 GitHub 的 90 天物理保留期。
+            ## 自动生成的日志备份
+            - 包含仓库内最近 1000 条任务的控制台文本输出。
+            - 状态分类：已按成功/失败状态对文件夹进行重命名。
+            - 触发原因：${{ github.event.inputs.reason || '定时自动备份' }}
           files: ${{ env.ZIP_FILE }}
+          draft: false
+          prerelease: false
