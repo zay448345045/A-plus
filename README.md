@@ -1,5 +1,5 @@
 # Arcade-plus
-
+[![Total Downloads](https://img.shields.io/github/downloads/zay448345045/Arcade-plus/total?style=for-the-badge&color=2ea44f&logo=github)](https://github.com/zay448345045/Arcade-plus/releases)
 Arcade is a utility used to edit and preview aff files. The original Arcade repository was taken down due to [GitHub's DMCA takedown policy](https://docs.github.com/en/site-policy/content-removal-policies/dmca-takedown-policy) (see [the DMCA takedown request](https://github.com/github/dmca/blob/master/2019/02/2019-02-27-Arcaea.md)). The author of the original Arcade, [cnSchwarzer](https://github.com/cnSchwarzer) aka Sch, refused to remove copyrighted content owned by Lowiro, the developer of Arcaea. Sch used a Chinese code hosting platform after that instead.
 
 This project, Arcade-plus brings it back to GitHub. It does not contain any copyrighted content, but uses a skinning feature instead. We also have better commit messages and less bugs. What's more, we will add some new features, get some redesigns and do some performance optimizations.
