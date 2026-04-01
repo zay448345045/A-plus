@@ -1,0 +1,54 @@
+name: Export All Logs to Release (Softprops)
+
+on:
+  workflow_dispatch: # 手动触发
+
+jobs:
+  export-logs:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write # 必须有写入权限才能创建 Release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Fetch and Package All Logs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p all-repo-logs
+          echo "正在检索历史运行记录..."
+
+          # 获取最近 1000 条已完成的任务 ID
+          # 过滤掉当前正在运行的 ID 以免冲突
+          run_ids=$(gh run list --limit 1000 --json databaseId,status --jq '.[] | select(.status=="completed") | .databaseId')
+
+          for id in $run_ids; do
+            if [ "$id" == "$GITHUB_RUN_ID" ]; then continue; fi
+            echo "正在下载 Run ID: $id ..."
+            gh run view $id --log-zip > "all-repo-logs/run-$id.zip" || echo "跳过 $id (文件已过期)"
+          done
+
+          # 打包，文件名带上日期
+          zip_name="all-actions-logs-$(date +'%Y%m%d%H%M').zip"
+          zip -r "$zip_name" all-repo-logs/
+          
+          # 传递文件名给后续步骤
+          echo "ZIP_FILE=$zip_name" >> $GITHUB_ENV
+          echo "TAG_NAME=logs-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_ENV
+
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: "Action日志自动备份 - ${{ env.TAG_NAME }}"
+          body: |
+            ## 📦 自动日志备份
+            - **导出时间**: ${{ env.TAG_NAME }}
+            - **包含内容**: 该项目下所有可获取的已完成 Workflow 运行日志。
+            - **注意**: 超过 GitHub 保留期（默认90天）且未被手动保留的日志将无法抓取。
+          files: ${{ env.ZIP_FILE }}
+          draft: false
+          prerelease: false
