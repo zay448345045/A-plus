@@ -13,7 +13,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
+        with:
+          ref: checkout
+          fetch-depth: 1
       - name: Fetch and Package All Logs (Success & Failure)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
