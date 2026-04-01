@@ -72,6 +72,15 @@ jobs:
             echo "FILE_PATH=Full_Archive_$(date +'%Y%m%d').zip" >> $GITHUB_ENV
             echo "TAG_NAME=logs-$(date +'%Y%m%d-%H%M')" >> $GITHUB_ENV
           fi
+      - name: "🔍 调试：检查文件状态"
+        run: |
+          echo "检查全路径日志目录:"
+          ls -R all-repo-logs || echo "目录不存在"
+          echo "检查压缩包:"
+          ls -lh Full_Archive_*.zip || echo "压缩包未生成"
+          echo "环境变量 FILE_PATH 的值: ${{ env.FILE_PATH }}"
+
+
 
       - name: "🚀 发布 Release (Softprops)"
         if: env.FILE_PATH != ''
