@@ -1,15 +1,16 @@
-name: "🛠️ 技术主权：日志原样存档与自托管勋章"
+name: "🛠️ 完整版：日志原样存档与勋章挂靠 (Softprops)"
 
 on:
 #  schedule:
 #    - cron: '0 0 * * 1' # 每周一凌晨运行
-  workflow_dispatch:      # 支持手动触发抢救
+  workflow_dispatch:      # 支持手动触发
 
 permissions:
-  contents: write         # 必须开启写入权限
+  contents: write         # 允许推送勋章和创建 Release
+  actions: read           # 允许读取历史日志
 
 jobs:
-  archive-and-badge:
+  archive-process:
     runs-on: ubuntu-latest
     steps:
       - name: "🛒 检出仓库代码"
@@ -18,33 +19,36 @@ jobs:
           ref: checkout
           fetch-depth: 0
 
-      - name: "📊 生成自托管下载量勋章"
+      - name: "📊 制作并挂靠下载量勋章"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p badges
           # 获取全仓库所有 Release 的下载总量
           TOTAL_DL=$(gh api repos/${{ github.repository }}/releases --jq '[.[].assets[].download_count] | add // 0')
-          echo "累计下载量: $TOTAL_DL"
           
-          # 调用 Shields API 生成静态 SVG (仅作为制图工具)
-          # 颜色使用了符合你风格的深蓝色，加入了 GitHub Logo
+          # 使用 Shields.io 接口生成 SVG 静态文件
           curl -L "https://img.shields.io/badge/Total_Downloads-$TOTAL_DL-blue?style=for-the-badge&logo=github" \
                -o badges/downloads.svg
-          echo "勋章已更新至 ./badges/downloads.svg"
+          
+          # 配置 Git 并推送到仓库（实现 raw.githubusercontent 挂靠）
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git add badges/downloads.svg
+          git commit -m "📊 Update badge: $TOTAL_DL downloads [skip ci]" || echo "No changes to commit"
+          git push
 
-      - name: "🗄️ 抢救原始分步骤日志 (ZIP 模式)"
+      - name: "🗄️ 抢救 1:1 原始日志压缩包"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p all-repo-logs
-          echo "正在全量检索 1:1 原始日志包..."
-
-          # 获取最近 100 条已完成记录 (可根据需求调高至 1000)
-          run_data=$(gh run list --limit 1000 --json databaseId,workflowName,conclusion --jq '.[] | select(.status=="completed")')
+          # 抓取最近 50 条已完成的运行记录
+          run_data=$(gh run list --limit 500 --json databaseId,workflowName,conclusion --jq '.[] | select(.status=="completed")')
 
           echo "$run_data" | jq -c '.' | while read -r item; do
             id=$(echo "$item" | jq -r '.databaseId')
+            # 跳过当前正在运行的这个任务
             if [ "$id" == "$GITHUB_RUN_ID" ]; then continue; fi
             
             wf_name=$(echo "$item" | jq -r '.workflowName | gsub(" "; "_")')
@@ -53,40 +57,33 @@ jobs:
             target_dir="all-repo-logs/${wf_name}_${conclusion}/run-$id"
             mkdir -p "$target_dir"
             
-            echo "▶️ 正在获取原始包: [$conclusion] $wf_name (ID: $id)"
-            
-            # 关键逻辑：直接请求 GitHub 官方的 Logs 重定向地址
-            # 这个接口返回的是分步骤 txt 的压缩包
+            # 核心：抓取 GitHub 官方生成的原始分步骤 ZIP 日志
             if gh api repos/${{ github.repository }}/actions/runs/$id/logs > "$target_dir/original_steps_logs.zip" 2>/dev/null; then
-              echo "   ✅ 原始日志包抓取成功。"
+              echo "   ✅ 已保存 ID: $id"
             else
-              echo "   ❌ 日志已过期物理删除。"
+              echo "   ❌ 日志已物理过期"
               rm -rf "$target_dir"
             fi
           done
 
-          # 清理空目录并打包
-          find all-repo-logs -type d -empty -delete
-          if [ -n "$(ls -A all-repo-logs 2>/dev/null)" ]; then
-            zip -r "full-archive-$(date +'%Y%m%d').zip" all-repo-logs/
-            echo "ARCHIVE_NAME=full-archive-$(date +'%Y%m%d').zip" >> $GITHUB_ENV
+          # 打包所有抓取到的日志
+          if [ -d "all-repo-logs" ] && [ "$(ls -A all-repo-logs)" ]; then
+            zip -r "Full_Archive_$(date +'%Y%m%d').zip" all-repo-logs/
+            echo "FILE_PATH=Full_Archive_$(date +'%Y%m%d').zip" >> $GITHUB_ENV
+            echo "TAG_NAME=logs-$(date +'%Y%m%d-%H%M')" >> $GITHUB_ENV
           fi
 
-      - name: "🚀 提交勋章并发布存档"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # 1. 提交勋章图片回仓库 (实现 Pages/Raw 挂靠)
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add badges/downloads.svg
-          git commit -m "📊 自动更新下载量勋章 [skip ci]" || echo "无勋章更新"
-          git push
-
-          # 2. 如果有日志存档，发布到 Release
-          if [ -f "${{ env.ARCHIVE_NAME }}" ]; then
-            TAG="archive-$(date +'%Y%m%d-%H%M%S')"
-            gh release create "$TAG" "${{ env.ARCHIVE_NAME }}" \
-               --title "日志存档与下载量统计备份" \
-               --notes "包含 1:1 还原网页版的分步骤原始日志压缩包。"
-          fi
+      - name: "🚀 发布 Release (Softprops)"
+        if: env.FILE_PATH != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: "Action 原始日志存档 (${{ env.TAG_NAME }})"
+          files: ${{ env.FILE_PATH }}
+          body: |
+            ## 自动化备份报告
+            - **类型**: 1:1 原始步骤日志 (ZIP)
+            - **包含范围**: 最近 50 条完成的 Workflow 记录
+            - **勋章更新**: 下载量统计已同步至 `badges/downloads.svg`
+          draft: false
+          prerelease: false
