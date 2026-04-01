@@ -1,0 +1,93 @@
+name: "🚀 Actions 1:1 原生分步骤日志全量存档"
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: '手动触发原因'
+        required: false
+        default: '手动抢救 1:1 原始分步骤日志'
+
+jobs:
+  backup-and-upload:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 必须：用于创建 Release
+      actions: read    # 必须：用于读取其他 Run 的原始日志文件
+
+    steps:
+      - name: "🛒 检出仓库"
+        uses: actions/checkout@v6
+        with:
+          ref: checkout
+          fetch-depth: 1
+
+      - name: "🛠️ 执行 1:1 原始日志抓取脚本"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p native-logs-archive
+          echo "正在检索并抓取原始分步骤日志包 (ZIP)..."
+          
+          # 获取最近 1000 条已完成记录
+          run_data=$(gh run list --limit 1000 --json databaseId,status,workflowName,conclusion --jq '.[] | select(.status=="completed")')
+          
+          if [ -z "$run_data" ]; then
+            echo "未找到任何已完成的记录。"
+            exit 0
+          fi
+
+          echo "$run_data" | jq -c '.' | while read -r item; do
+            id=$(echo "$item" | jq -r '.databaseId')
+            if [ "$id" == "$GITHUB_RUN_ID" ]; then continue; fi
+            
+            wf_name=$(echo "$item" | jq -r '.workflowName | gsub("[ /]"; "_")')
+            conclusion=$(echo "$item" | jq -r '.conclusion')
+            
+            # 创建存放该次运行日志的目录
+            target_dir="native-logs-archive/${wf_name}_${conclusion}/run-$id"
+            mkdir -p "$target_dir"
+            
+            echo "▶️ 正在拉取原始 ZIP: [$conclusion] $wf_name (ID: $id)"
+            
+            # 核心操作：调用 API 获取原始日志重定向包
+            # -L 处理重定向，-f 报错退出，直接输出到目标 zip
+            if gh api "/repos/${{ github.repository }}/actions/runs/$id/logs" > "$target_dir/original_steps.zip" 2>/dev/null; then
+              # 验证下载的是否为有效 ZIP (防止抓到报错网页)
+              if file "$target_dir/original_steps.zip" | grep -q "Zip archive data"; then
+                 echo "   ✅ 抓取成功"
+              else
+                 echo "   ⚠️ 日志文件已物理过期 (虽然记录还在)"
+                 rm -rf "$target_dir"
+              fi
+            else
+              rm -rf "$target_dir"
+            fi
+          done
+
+          # 清理并最终打包
+          find native-logs-archive -type d -empty -delete
+          
+          if [ -z "$(ls -A native-logs-archive 2>/dev/null)" ]; then
+            echo "❌ 没有捞到任何有效的原始日志包。"
+            exit 0
+          fi
+
+          final_zip="native-steps-archive-$(date +'%Y%m%d-%H%M').zip"
+          zip -r -q "$final_zip" native-logs-archive/
+          
+          echo "ZIP_FILE=$final_zip" >> $GITHUB_ENV
+          echo "TAG_NAME=native-logs-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_ENV
+
+      - name: "📦 发布至 Release (永久存档)"
+        if: env.ZIP_FILE != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: "原生分步骤日志存档: $(date +'%Y-%m-%d %H:%M')"
+          body: |
+            ## 1:1 原始日志备份说明
+            - **结构**: 每个任务文件夹内包含一个 `original_steps.zip`。
+            - **内容**: 解压该内部 ZIP 后，即可看到 `1_Setup.txt`, `2_Build.txt` 等分步骤文件。
+            - **触发**: ${{ github.event.inputs.reason }}
+          files: ${{ env.ZIP_FILE }}
